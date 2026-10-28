@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --ink: #18231f;
+  --muted: #6b7771;
+  --paper: #f6f7f3;
+  --line: #e4e8e1;
+  --green: #147a59;
+  --green-dark: #0f6247;
+  --green-soft: #e7f3ec;
+  --amber: #a96617;
+  --red: #bb4a43;
+}
+
+* { box-sizing: border-box; }
+
+html { min-height: 100%; background: var(--paper); }
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(ellipse at 14% -5%, rgba(184, 221, 197, .4), transparent 30rem),
+    var(--paper);
+  color: var(--ink);
+  font-family: Arial, Helvetica, sans-serif;
+  font-feature-settings: "ss01" on;
+}
+
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+
+.card-shadow { box-shadow: 0 2px 6px rgba(22, 40, 31, .04), 0 14px 38px rgba(22, 40, 31, .045); }
+.focus-ring:focus-visible { outline: 3px solid rgba(20, 122, 89, .24); outline-offset: 2px; }
+
+@keyframes soft-in {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-in { animation: soft-in .35s ease-out both; }
