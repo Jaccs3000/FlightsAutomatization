@@ -43,4 +43,42 @@ describe("Gmail flight alert message", () => {
 
     expect(message.subject).toBe("Vuelo CTG → CLO - 25 Mar - $ 180.000 - 1 adulto");
   });
+
+  it("groups same-price airline options while preserving real outbound-return pairs", () => {
+    const option = {
+      outboundAirline: "Avianca", outboundLogoUrl: "https://www.gstatic.com/flights/airline_logos/70px/AV.png", inboundAirline: "Avianca", inboundLogoUrl: "https://www.gstatic.com/flights/airline_logos/70px/AV.png", outboundDepartureTime: "9:20 a. m.",
+      outboundArrivalTime: "10:30 a. m.", inboundDepartureTime: "1:20 p. m.", inboundArrivalTime: "5:45 p. m.",
+      amount: 350000, currency: "COP", outboundStops: "Directo", inboundStops: "Directo", separateTickets: false,
+    };
+    const message = buildPriceAlertMessage({
+      followUp,
+      results: [{ ...result, flightOptions: [option, { ...option, outboundDepartureTime: "4:00 p. m.", outboundArrivalTime: "5:10 p. m." }], flightDetailsStatus: "available" }],
+      runTime: "",
+    });
+    expect(message.html.match(/<strong>Precio:<\/strong>/g)).toHaveLength(1);
+    expect(message.html).toContain("Aerolínea:</strong> <img");
+    expect(message.html).toContain("</strong> · 2026-11-15");
+    expect(message.html).toContain("width=\"26\" height=\"26\"");
+    expect(message.html).toContain("airline_logos/70px/AV.png");
+    expect(message.html).toContain("9:20 a. m. - 10:30 a. m.");
+    expect(message.html).toContain("4:00 p. m. - 5:10 p. m.");
+    expect(message.html).toContain("1:20 p. m. - 5:45 p. m.");
+  });
+
+  it("shows each carrier when a real pairing uses different airlines and keeps calendar fallback", () => {
+    const option = {
+      outboundAirline: "Avianca", inboundAirline: "LATAM", outboundDepartureTime: "9:20 a. m.",
+      outboundArrivalTime: "10:30 a. m.", inboundDepartureTime: "1:20 p. m.", inboundArrivalTime: "5:45 p. m.",
+      amount: 350000, currency: "COP", outboundStops: null, inboundStops: null, separateTickets: true,
+    };
+    const message = buildPriceAlertMessage({
+      followUp, results: [
+        { ...result, flightOptions: [option], flightDetailsStatus: "available" },
+        { ...result, outboundDate: "2026-11-16", flightOptions: [], flightDetailsStatus: "unavailable" },
+      ], runTime: "",
+    });
+    expect(message.html).toContain("Avianca (ida) / LATAM (regreso)");
+    expect(message.html).toContain("Incluye boletos separados.");
+    expect(message.html).toContain("no fue posible cargar el detalle de horarios");
+  });
 });

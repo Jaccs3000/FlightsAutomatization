@@ -57,6 +57,26 @@ export interface FlightPriceResult {
   meetsThreshold: boolean;
   observedText: string;
   details: string | null;
+  flightOptions?: FlightItineraryOption[];
+  flightDetailsStatus?: "available" | "unavailable";
+}
+
+export interface FlightItineraryOption {
+  outboundAirline: string;
+  outboundLogoUrl?: string | null;
+  outboundOperatedBy?: string | null;
+  inboundAirline: string | null;
+  inboundLogoUrl?: string | null;
+  inboundOperatedBy?: string | null;
+  outboundDepartureTime: string;
+  outboundArrivalTime: string;
+  inboundDepartureTime: string | null;
+  inboundArrivalTime: string | null;
+  amount: number;
+  currency: string;
+  outboundStops: string | null;
+  inboundStops: string | null;
+  separateTickets: boolean;
 }
 
 export interface RunRecord {

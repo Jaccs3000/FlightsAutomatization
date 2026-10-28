@@ -23,7 +23,7 @@ El lanzador no instala dependencias ni modifica variables de entorno o el Regist
 2. Para los siguientes inicios, abre `INICIAR_VUELA_SILENCIOSO.vbs`. El lanzador inicia el servidor en segundo plano si hace falta y abre `http://127.0.0.1:3030`.
 3. Si la app no inicia, revisa `data/launcher.log` y `data/app.log`.
 
-El inicio silencioso mantiene el scheduler activo en segundo plano. Para cerrarlo, detén el proceso de Node que ejecuta Vuela desde el Administrador de tareas o reinicia Windows.
+El inicio silencioso mantiene el scheduler activo en segundo plano. Desde el botón **Cerrar app** en la parte superior derecha puedes detener backend y scheduler. Chrome puede impedir que la app cierre una pestaña que no abrió por sí misma; en ese caso la pestaña de Vuela se reemplaza por una página en blanco. Usa **Reiniciar** para volver a levantar el servidor con el código actual; la pantalla espera a que responda y vuelve a cargar los datos. No se permite cerrar o reiniciar mientras haya una consulta de vuelos activa.
 
 ## Envío de correo con EmailJS
 
@@ -39,9 +39,9 @@ Vuela usa la API HTTPS de EmailJS, no SMTP. La cuenta Gmail se conecta directame
 
 - Configura alertas de solo ida o ida/vuelta, aeropuertos IATA, fechas exactas o rangos, adultos y límite total en COP.
 - En ida/vuelta se admiten hasta 50 pares de fechas y al menos una noche. Los rangos flexibles admiten hasta 31 días por tramo; el horizonte máximo es 365 días.
-- La app selecciona los días dentro del calendario para que Google muestre los precios. Nunca pulsa **Buscar**. Los días sin precio se omiten.
+- La app selecciona días en el calendario y lee precios sin pulsar **Buscar**. Solo después de encontrar un importe que cumple el umbral, pulsa **Buscar** para cargar los vuelos y extraer aerolíneas y horarios.
 - Solo compara valores COP contra el límite. Otros importes se guardan con su moneda y no generan alertas.
-- Cada seguimiento que tenga coincidencias recibe un correo por ejecución, con todas sus combinaciones que cumplen el límite.
+- Cada seguimiento que tenga coincidencias recibe un correo por ejecución, con horarios agrupados por precio y aerolínea. Las parejas reales de ida y regreso se conservan individualmente; si cambia la aerolínea entre tramos, se muestra cada una. Si Google no carga el detalle, se envía el precio del calendario como respaldo.
 - Las horas diarias usan la zona `America/Bogota`; por defecto 08:00, 13:00 y 21:00. Las ejecuciones procesan seguimientos activos secuencialmente; no hay recuperación de horas perdidas cuando la app estaba cerrada.
 - El historial conserva cinco días por defecto; el valor puede cambiarse en Ajustes.
 - Los datos de la aplicación están en `data/vuela.duckdb`. Cópialo con Vuela cerrada para hacer una copia de respaldo.

@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, ArrowDownUp, ArrowLeftRight, ArrowRight, Bell, CalendarDays, Check, ChevronDown, Eye, EyeOff,
   CircleAlert, Clock3, Compass, ExternalLink, History, LockKeyhole, Mail, MapPin, Minus,
   MoreHorizontal, Pause, Plane, Plus, Play, RefreshCw, ScrollText, Search, Settings2, ShieldCheck,
-  Sparkles, Trash2, TrendingDown, X,
+  Sparkles, Trash2, TrendingDown, X, Power, RotateCw,
 } from "lucide-react";
 import type { AppSettings, FollowUp, FollowUpInput, RunWithResults } from "@/lib/types";
 import { DEFAULT_SETTINGS } from "@/lib/types";
@@ -15,6 +15,22 @@ type VaultState = { configured: boolean; unlocked: boolean };
 type EmailJsCredentials = { serviceId: string; templateId: string; publicKey: string; privateKey: string };
 type ApiError = { error?: string };
 type DiagnosticLog = { id: string; createdAt: string; area: string; event: string; outcome: "info" | "success" | "warning" | "error"; message: string };
+type LifecycleAction = "idle" | "stopping" | "restarting";
+const restartSessionKey = "vuela_restart_pending";
+
+function delay(milliseconds: number) { return new Promise((resolve) => window.setTimeout(resolve, milliseconds)); }
+
+function closeCurrentTab() {
+  try { window.close(); } catch { /* Chrome can block closing a tab opened outside JavaScript. */ }
+  window.setTimeout(() => { if (!window.closed) window.location.replace("about:blank"); }, 350);
+}
+
+function broadcastLifecycle(action: "stop" | "reload") {
+  if (typeof BroadcastChannel === "undefined") return;
+  const channel = new BroadcastChannel("vuela-lifecycle");
+  channel.postMessage(action);
+  channel.close();
+}
 
 const navItems: Array<{ key: PageKey; title: string; icon: typeof Activity }> = [
   { key: "overview", title: "Resumen", icon: Activity },
@@ -60,6 +76,11 @@ function formatCop(value: number) {
 function formatObservedPrice(value: number, currency: string | null) {
   if (!currency || currency === "COP") return formatCop(value);
   return `${currency} ${new Intl.NumberFormat("es-CO", { maximumFractionDigits: 0 }).format(value)}`;
+}
+
+function AirlineLogo({ src, name }: { src?: string | null; name: string }) {
+  if (!src || !/^https:\/\//i.test(src)) return null;
+  return <img src={src} alt="" aria-label={`${name} logo`} loading="lazy" className="h-6 w-6 shrink-0 rounded object-contain" onError={(event) => { event.currentTarget.style.display = "none"; }} />;
 }
 
 function dateDescription(mode: string, start: string, end: string | null) {
@@ -189,7 +210,7 @@ function HistoryRow({ run }: { run: RunWithResults }) {
       <p className="text-[11px] text-[#87938c]">Inicio: {formatDateTime(run.startedAt)} · Fin: {formatDateTime(run.finishedAt)}</p>
       {run.scheduledAt && <p className="text-[11px] text-[#87938c]">Hora programada: {formatDateTime(run.scheduledAt)} (Bogotá)</p>}
       {(run.notificationRecipient || run.notificationSentAt || run.notificationError) && <p className="text-xs text-[#58675e]">Correo: {run.notificationRecipient || "destinatario sin configurar"}{run.notificationSentAt ? ` · enviado ${formatDateTime(run.notificationSentAt)}` : ""}{run.notificationError ? ` · ${run.notificationError}` : ""}</p>}
-      {run.results.map((result, index) => <p key={`${result.outboundDate}-${result.inboundDate}-${index}`} className="text-xs text-[#58675e]"><span className="font-semibold">{result.outboundDate}{result.inboundDate ? ` → ${result.inboundDate}` : ""}</span>{result.amount != null && <> · {formatObservedPrice(result.amount, result.currency)}</>}{result.meetsThreshold ? " · Cumple el límite" : ""}{result.details && <> · {result.details}</>}{result.observedText && <> · {result.observedText}</>}</p>)}
+      {run.results.map((result, index) => <div key={`${result.outboundDate}-${result.inboundDate}-${index}`} className="space-y-1 text-xs text-[#58675e]"><p><span className="font-semibold">{result.outboundDate}{result.inboundDate ? ` → ${result.inboundDate}` : ""}</span>{result.amount != null && <> · {formatObservedPrice(result.amount, result.currency)}</>}{result.meetsThreshold ? " · Cumple el límite" : ""}{result.details && <> · {result.details}</>}{result.observedText && <> · {result.observedText}</>}</p>{result.flightDetailsStatus === "unavailable" && <p className="text-[#9b6a17]">No se pudo cargar el detalle de horarios; se conserva el precio del calendario.</p>}{result.flightOptions?.map((option, optionIndex) => <p key={optionIndex} className="flex flex-wrap items-center gap-1.5 pl-3"><span className="inline-flex items-center gap-1.5"><AirlineLogo src={option.outboundLogoUrl} name={option.outboundAirline}/>{option.outboundAirline}</span>{option.inboundAirline && option.inboundAirline !== option.outboundAirline && <span className="inline-flex items-center gap-1.5">ida / <AirlineLogo src={option.inboundLogoUrl} name={option.inboundAirline}/>{option.inboundAirline} regreso</span>}<span>· Ida {option.outboundDepartureTime}–{option.outboundArrivalTime}{option.inboundDepartureTime && option.inboundArrivalTime ? ` · Regreso ${option.inboundDepartureTime}–${option.inboundArrivalTime}` : ""} · {formatObservedPrice(option.amount, option.currency)}{option.separateTickets ? " · Boletos separados" : ""}</span></p>)}</div>)}
     </div>}</div>}
   </article>;
 }
@@ -208,8 +229,11 @@ export default function Home() {
   const [runner, setRunner] = useState<{ running: boolean; currentLabel: string | null; startedAt: string | null }>({ running: false, currentLabel: null, startedAt: null });
   const [modal, setModal] = useState<FollowUp | null | false>(false);
   const [toast, setToast] = useState("");
+  const [lifecycleAction, setLifecycleAction] = useState<LifecycleAction>("idle");
   const [busy, setBusy] = useState(false);
   const [vaultKey, setVaultKey] = useState("");
+  const vaultKeyInputRef = useRef<HTMLInputElement>(null);
+  const focusVaultKeyOnSettings = useRef(false);
   const [showVaultKey, setShowVaultKey] = useState(false);
   const [emailJsConfig, setEmailJsConfig] = useState<EmailJsCredentials>({ serviceId: "", templateId: "", publicKey: "", privateKey: "" });
   const [emailJsConfigured, setEmailJsConfigured] = useState(false);
@@ -223,7 +247,7 @@ export default function Home() {
   const [historyFrom, setHistoryFrom] = useState("");
   const [historyTo, setHistoryTo] = useState("");
 
-  const refresh = useCallback(async (options?: { preserveSettingsDraft?: boolean }) => {
+  const refresh = useCallback(async (options?: { preserveSettingsDraft?: boolean; quiet?: boolean }) => {
     try {
       const [followData, historyData, settingsData, runnerData, diagnosticData, emailJsData] = await Promise.all([
         requestJson<{ followUps: FollowUp[] }>("/api/follow-ups"),
@@ -242,10 +266,48 @@ export default function Home() {
         setEmailJsPrivateKeyConfigured(emailJsData.privateKeyConfigured);
       }
       setVault({ ...settingsData.vault, unlocked: settingsData.unlocked }); setRunner(runnerData); setDiagnostics(diagnosticData.logs);
-    } catch (error) { setToast(error instanceof Error ? error.message : "No se pudo cargar la app."); }
+      return true;
+    } catch (error) { if (!options?.quiet) setToast(error instanceof Error ? error.message : "No se pudo cargar la app."); return false; }
   }, []);
 
-  useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh({ preserveSettingsDraft: true }), 8000); return () => window.clearInterval(timer); }, [refresh]);
+  useEffect(() => {
+    const pendingRestart = sessionStorage.getItem(restartSessionKey) === "1";
+    if (pendingRestart) {
+      setLifecycleAction("restarting");
+      void (async () => {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          if (await refresh({ quiet: true })) {
+            sessionStorage.removeItem(restartSessionKey);
+            setLifecycleAction("idle"); setToast("Aplicación reiniciada y datos cargados.");
+            return;
+          }
+          await delay(500);
+        }
+        setLifecycleAction("idle"); setToast("La aplicación reinició, pero no se pudieron cargar todos los datos. Recarga la página.");
+      })();
+    } else void refresh();
+    const timer = window.setInterval(() => void refresh({ preserveSettingsDraft: true }), 8000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel("vuela-lifecycle");
+    channel.onmessage = (event: MessageEvent<"stop" | "reload">) => {
+      if (event.data === "stop") closeCurrentTab();
+      if (event.data === "reload") { sessionStorage.setItem(restartSessionKey, "1"); window.location.reload(); }
+    };
+    return () => channel.close();
+  }, []);
+  useEffect(() => {
+    if (page !== "settings" || !focusVaultKeyOnSettings.current) return;
+    focusVaultKeyOnSettings.current = false;
+    const frame = window.requestAnimationFrame(() => {
+      const input = vaultKeyInputRef.current;
+      input?.scrollIntoView({ behavior: "smooth", block: "center" });
+      input?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [page]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 4200); return () => window.clearTimeout(timer); }, [toast]);
 
   const activeCount = followUps.filter((item) => item.status === "active").length;
@@ -316,6 +378,50 @@ export default function Home() {
     catch (error) { setToast(error instanceof Error ? error.message : "No se pudo enviar el correo de prueba."); }
     finally { setTestingEmail(false); }
   }
+  async function stopApplication() {
+    if (runner.running || lifecycleAction !== "idle") return;
+    // Send the stop request as a keepalive, then try to close synchronously
+    // within the button's click event so browsers are more likely to allow it.
+    const stopRequest = requestJson("/api/lifecycle", { method: "POST", body: JSON.stringify({ action: "stop" }), keepalive: true });
+    setLifecycleAction("stopping"); setToast("Cerrando aplicación...");
+    broadcastLifecycle("stop");
+    closeCurrentTab();
+    try {
+      await stopRequest;
+    } catch (error) {
+      if (!window.closed) { setLifecycleAction("idle"); setToast(error instanceof Error ? error.message : "No se pudo cerrar la aplicación."); }
+    }
+  }
+  async function restartApplication() {
+    if (runner.running || lifecycleAction !== "idle") return;
+    setLifecycleAction("restarting"); setToast("Reiniciando aplicación...");
+    try {
+      await requestJson("/api/lifecycle", { method: "POST", body: JSON.stringify({ action: "restart" }) });
+      let sawServerStop = false;
+      const startedAt = Date.now();
+      for (let attempt = 0; attempt < 180; attempt++) {
+        await delay(500);
+        try {
+          const response = await fetch("/api/lifecycle/health", { cache: "no-store" });
+          if (!response.ok) sawServerStop = true;
+          else if (sawServerStop || Date.now() - startedAt > 2_500) {
+            sessionStorage.setItem(restartSessionKey, "1");
+            broadcastLifecycle("reload");
+            window.location.reload();
+            return;
+          }
+        } catch { sawServerStop = true; }
+      }
+      throw new Error("La aplicación no volvió a responder en 90 segundos. Intenta iniciarla desde INICIAR_VUELA.bat.");
+    } catch (error) {
+      setLifecycleAction("idle");
+      setToast(error instanceof Error ? error.message : "No se pudo reiniciar la aplicación.");
+    }
+  }
+  function openVaultKeyField() {
+    focusVaultKeyOnSettings.current = true;
+    setPage("settings");
+  }
 
   const title = navItems.find((item) => item.key === page)?.title ?? "Resumen";
   const nextTime = settings.scheduleTimes.find((time) => time > new Intl.DateTimeFormat("en-GB", { timeZone: "America/Bogota", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date())) ?? settings.scheduleTimes[0];
@@ -329,7 +435,7 @@ export default function Home() {
     </aside>
 
     <main className="min-h-screen lg:pl-[246px]">
-      <header className="sticky top-0 z-10 border-b border-[#e6ebe5]/80 bg-[#f8faf6]/80 px-5 py-3 backdrop-blur-xl sm:px-8 lg:px-10"><div className="mx-auto flex max-w-[1320px] items-center justify-between"><div className="flex items-center gap-3 lg:hidden"><span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#147a59] text-white"><Plane size={18}/></span><span className="font-bold tracking-[-.04em]">vuela.</span></div><div className="hidden lg:block"><p className="text-xs text-[#93a098]">Tu espacio <span className="px-1.5">/</span><span className="font-medium text-[#54635b]">{title}</span></p></div><div className="flex items-center gap-2.5"><span className="hidden items-center gap-1.5 rounded-full border border-[#e3e9e2] bg-white/70 px-3 py-1.5 text-[11px] font-medium text-[#6d7b72] sm:flex"><span className="h-1.5 w-1.5 rounded-full bg-[#31a56d]"/> {runner.running ? "Revisando vuelos" : "Scheduler conectado"}</span><button onClick={() => setPage("settings")} className="flex h-9 w-9 items-center justify-center rounded-full border border-[#e1e7e0] bg-white text-xs font-semibold text-[#4f6759]">V</button></div></div></header>
+      <header className="sticky top-0 z-10 border-b border-[#e6ebe5]/80 bg-[#f8faf6]/80 px-5 py-3 backdrop-blur-xl sm:px-8 lg:px-10"><div className="mx-auto flex max-w-[1320px] items-center justify-between"><div className="flex items-center gap-3 lg:hidden"><span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#147a59] text-white"><Plane size={18}/></span><span className="font-bold tracking-[-.04em]">vuela.</span></div><div className="hidden lg:block"><p className="text-xs text-[#93a098]">Tu espacio <span className="px-1.5">/</span><span className="font-medium text-[#54635b]">{title}</span></p></div><div className="flex items-center gap-1.5 sm:gap-2.5"><span className="hidden items-center gap-1.5 rounded-full border border-[#e3e9e2] bg-white/70 px-3 py-1.5 text-[11px] font-medium text-[#6d7b72] xl:flex"><span className="h-1.5 w-1.5 rounded-full bg-[#31a56d]"/> {runner.running ? "Revisando vuelos" : "Scheduler conectado"}</span><button type="button" onClick={() => void stopApplication()} disabled={runner.running || lifecycleAction !== "idle"} title="Cerrar aplicación" className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-[#e1e7e0] bg-white px-2.5 text-xs font-semibold text-[#59685f] transition hover:bg-[#f2f6f1] disabled:opacity-50 sm:px-3"><Power size={15}/><span className="hidden sm:inline">Cerrar app</span></button><button type="button" onClick={() => void restartApplication()} disabled={runner.running || lifecycleAction !== "idle"} title="Reiniciar aplicación" className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl bg-[#147a59] px-2.5 text-xs font-semibold text-white transition hover:bg-[#106b4e] disabled:opacity-50 sm:px-3"><RotateCw size={15} className={lifecycleAction === "restarting" ? "animate-spin" : ""}/><span className="hidden sm:inline">Reiniciar</span></button><button onClick={() => setPage("settings")} aria-label="Abrir configuración" className="flex h-9 w-9 items-center justify-center rounded-full border border-[#e1e7e0] bg-white text-xs font-semibold text-[#4f6759]">V</button></div></div></header>
 
       <div className="mx-auto max-w-[1320px] px-5 pb-12 pt-8 sm:px-8 lg:px-10 lg:pt-10">
         <div className="mb-7 flex gap-1 overflow-x-auto lg:hidden">{navItems.map(({ key, title: itemTitle, icon: Icon }) => <button key={key} onClick={() => setPage(key)} className={`flex shrink-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium ${page === key ? "bg-[#e6f1e9] text-[#176d4f]" : "text-[#77837c]"}`}><Icon size={15}/>{itemTitle}</button>)}</div>
@@ -337,7 +443,7 @@ export default function Home() {
         {page === "overview" && <>
           {vault.configured && !vault.unlocked && <section role="alert" className="mb-6 flex flex-col gap-4 rounded-2xl border-2 border-[#b94d45] bg-[#fff0ed] p-4 shadow-md sm:flex-row sm:items-center sm:justify-between sm:px-5">
             <div className="flex items-start gap-3"><span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#b94d45] text-white"><LockKeyhole size={19}/></span><div><h2 className="font-bold text-[#8f302c]">La bóveda está bloqueada</h2><p className="mt-1 text-sm leading-5 text-[#773b37]">Las alertas de precio no podrán enviarse hasta que desbloquees la bóveda.</p></div></div>
-            <button type="button" onClick={() => setPage("settings")} className="focus-ring shrink-0 rounded-xl bg-[#a83d38] px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-[#8f302c]">Desbloquear bóveda</button>
+            <button type="button" onClick={openVaultKeyField} className="focus-ring shrink-0 rounded-xl bg-[#a83d38] px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-[#8f302c]">Desbloquear bóveda</button>
           </section>}
           <section className="animate-in flex flex-col justify-between gap-5 md:flex-row md:items-end"><div><div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[.13em] text-[#23805c]"><Sparkles size={14}/> Tu radar de vuelos</div><h1 className="mt-3 text-[34px] font-semibold leading-none tracking-[-.055em] text-[#1a2821] sm:text-[42px]">Buenos precios,<br className="sm:hidden"/> sin estar buscando.</h1><p className="mt-3 max-w-lg text-sm leading-6 text-[#7a877f]">Seguimos tus rutas y te avisamos cuando aparezca una tarifa que vale la pena.</p></div><div className="flex gap-2"><button onClick={() => void runNow()} disabled={busy || runner.running || activeCount === 0} className="focus-ring inline-flex h-11 items-center gap-2 rounded-xl border border-[#dce5dc] bg-white px-4 text-sm font-semibold text-[#52635a] transition hover:bg-[#f5f8f4] disabled:opacity-50"><RefreshCw size={15} className={runner.running ? "animate-spin" : ""}/>Revisar ahora</button><PrimaryButton onClick={() => setModal(null)}><Plus size={16}/> Nuevo seguimiento</PrimaryButton></div></section>
 
@@ -403,7 +509,7 @@ export default function Home() {
               </form>
 
               <section className="card-shadow rounded-[20px] border border-[#e6ebe5] bg-white p-5 sm:p-6"><div className="flex items-start gap-3"><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#fff3e6] text-[#b4772a]"><ShieldCheck size={18}/></span><div><h2 className="font-semibold">Bóveda local cifrada</h2><p className="mt-1 text-xs leading-5 text-[#87938c]">Las claves de EmailJS se cifran en el archivo local. La clave maestra solo permanece en memoria mientras está desbloqueada.</p></div></div>
-                <div className="mt-4 flex gap-2"><div className="relative min-w-0 flex-1"><input className={`${inputClass} pr-11`} type={showVaultKey ? "text" : "password"} autoComplete={vault.configured ? "current-password" : "new-password"} value={vaultKey} placeholder={vault.configured ? "Clave maestra" : "Crea una clave de 12+ caracteres"} onChange={(event) => setVaultKey(event.target.value)}/><button type="button" aria-label={showVaultKey ? "Ocultar clave maestra" : "Mostrar clave maestra"} onClick={() => setShowVaultKey((value) => !value)} className="absolute right-2 top-2.5 rounded-lg p-1.5 text-[#79867f] hover:bg-[#f1f5f1]">{showVaultKey ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div>{!vault.configured ? <button onClick={() => void vaultAction("setup")} className="focus-ring shrink-0 rounded-xl bg-[#273c30] px-3 text-xs font-semibold text-white">Crear bóveda</button> : vault.unlocked ? <button onClick={() => void vaultAction("lock")} className="focus-ring shrink-0 rounded-xl border border-[#e1e7e1] px-3 text-xs font-semibold text-[#54645a]">Bloquear</button> : <button onClick={() => void vaultAction("unlock")} className="focus-ring shrink-0 rounded-xl bg-[#273c30] px-3 text-xs font-semibold text-white">Desbloquear</button>}</div>
+                <div className="mt-4 flex gap-2"><div className="relative min-w-0 flex-1"><input ref={vaultKeyInputRef} className={`${inputClass} pr-11`} type={showVaultKey ? "text" : "password"} autoComplete={vault.configured ? "current-password" : "new-password"} value={vaultKey} placeholder={vault.configured ? "Clave maestra" : "Crea una clave de 12+ caracteres"} onChange={(event) => setVaultKey(event.target.value)}/><button type="button" aria-label={showVaultKey ? "Ocultar clave maestra" : "Mostrar clave maestra"} onClick={() => setShowVaultKey((value) => !value)} className="absolute right-2 top-2.5 rounded-lg p-1.5 text-[#79867f] hover:bg-[#f1f5f1]">{showVaultKey ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div>{!vault.configured ? <button onClick={() => void vaultAction("setup")} className="focus-ring shrink-0 rounded-xl bg-[#273c30] px-3 text-xs font-semibold text-white">Crear bóveda</button> : vault.unlocked ? <button onClick={() => void vaultAction("lock")} className="focus-ring shrink-0 rounded-xl border border-[#e1e7e1] px-3 text-xs font-semibold text-[#54645a]">Bloquear</button> : <button onClick={() => void vaultAction("unlock")} className="focus-ring shrink-0 rounded-xl bg-[#273c30] px-3 text-xs font-semibold text-white">Desbloquear</button>}</div>
                 <div className="mt-3 flex items-center gap-1.5 text-[11px] text-[#859189]"><LockKeyhole size={13}/>{vault.unlocked ? "Bóveda desbloqueada en memoria" : vault.configured ? "Bóveda bloqueada" : "Aún no configurada"}</div>
                 {vault.configured && !vault.unlocked && <button type="button" onClick={() => void resetVaultAction()} className="mt-3 text-[11px] font-semibold text-[#a44940] underline underline-offset-2">Olvidé la clave maestra · Restablecer bóveda</button>}
               </section>
@@ -414,6 +520,7 @@ export default function Home() {
       </div>
     </main>
     {modal !== false && <FollowUpModal initial={modal} onClose={() => setModal(false)} onSave={saveFollowUp}/>}
+    {lifecycleAction === "restarting" && <div role="status" aria-live="polite" className="fixed inset-0 z-[90] flex items-center justify-center bg-[#14251d]/45 p-5 backdrop-blur-sm"><div className="flex w-full max-w-sm items-center gap-4 rounded-2xl bg-white p-5 shadow-2xl"><RotateCw size={22} className="shrink-0 animate-spin text-[#147a59]"/><div><p className="font-semibold text-[#27352e]">Reiniciando aplicación...</p><p className="mt-1 text-sm text-[#75817b]">La información cargará cuando el servidor esté listo.</p></div></div></div>}
     {toast && <div role="status" className="fixed bottom-5 left-1/2 z-[70] flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2 rounded-xl bg-[#23372c] px-4 py-3 text-sm text-white shadow-xl"><Check size={16} className="shrink-0 text-[#a7dfba]"/>{toast}<button onClick={() => setToast("")} className="ml-2 text-white/70 hover:text-white"><X size={14}/></button></div>}
   </div>;
 }

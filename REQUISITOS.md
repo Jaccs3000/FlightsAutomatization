@@ -160,7 +160,7 @@ Los límites iniciales quedaron definidos para permitir rangos flexibles útiles
 
 - Las fechas de viaje no pueden estar a más de 365 días desde el día actual.
 - Cada rango flexible tendrá como máximo 31 fechas consecutivas, contando ambos extremos.
-- Ida y vuelta admite hasta 50 combinaciones válidas por seguimiento. La app selecciona cada par en el calendario y lee su precio sin pulsar Buscar.
+- Ida y vuelta admite hasta 50 combinaciones válidas por seguimiento. La app selecciona cada par en el calendario y lee su precio sin pulsar Buscar. Solo si un precio cumple el umbral, pulsa Buscar para abrir resultados y obtener aerolíneas y horarios.
 - No fijar un máximo rígido de seguimientos; procesarlos secuencialmente. El usuario espera unos cuatro al inicio.
 
 El máximo de 50 combinaciones queda fijado para la primera versión. Los seguimientos se procesan secuencialmente y pueden tardar más cuando hay varios pares de ida y vuelta.
@@ -181,10 +181,10 @@ El máximo de 50 combinaciones queda fijado para la primera versión. Los seguim
 - Ejecutar los horarios diarios en `America/Bogota`, omitir ejecuciones perdidas y no solapar lotes.
 - Ejecutar manualmente un seguimiento o todos los activos y registrar esas consultas.
 - Seguir trabajando con Chromium headless cuando Windows está activo o con la pantalla bloqueada.
-- Nunca pulsar **Buscar** ni lanzar la página de resultados por una acción equivalente.
+- No pulsar **Buscar** durante la consulta inicial del calendario. Solo después de encontrar un precio que cumple el umbral se permite pulsar Buscar para consultar detalles de vuelos.
 - Omitir fechas sin precio; guardar en historial errores de consulta y valores en moneda distinta de COP.
 - Comparar el precio total mostrado con el límite mediante `precio <= límite`.
-- Enviar un correo por seguimiento y ejecución, agrupando todos sus resultados; repetirlo en ejecuciones futuras si el precio sigue aplicando.
+- Enviar un correo por seguimiento y ejecución, agrupando horarios por precio y aerolínea; conservar cada pareja real ida-regreso en su propia línea y mostrar la aerolínea por tramo cuando difieran. Si no carga el detalle, enviar el precio del calendario como respaldo. Repetir en futuras ejecuciones si el precio sigue aplicando.
 - Cambiar destinatario, horarios y retención desde la app.
 - Conservar historial durante cinco días por defecto y permitir modificar la cantidad.
 - No guardar contraseñas de Gmail ni depender del almacén de credenciales de Windows; cifrar la configuración de EmailJS en la bóveda local.

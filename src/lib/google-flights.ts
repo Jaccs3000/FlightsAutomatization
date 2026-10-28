@@ -2,6 +2,8 @@ import { chromium, type Browser, type Page } from "playwright";
 import type { FlightPriceResult, FollowUp } from "./types";
 import { dateRange, validRoundTripPairs } from "./dates";
 import { parsePrice } from "./prices";
+import { parseGoogleFlightCard } from "./google-flights-parser";
+import type { FlightItineraryOption } from "./types";
 
 const FLIGHTS_URL = "https://www.google.com/travel/flights?hl=es-419&gl=CO&curr=COP";
 export const MAX_COMBINATIONS = 50;
@@ -128,6 +130,121 @@ async function prepareForm(page: Page, followUp: FollowUp) {
   await chooseAdults(page, followUp.adults);
 }
 
+async function resultCards(page: Page) {
+  const cards = page.locator('[role="link"][aria-label*="Seleccionar vuelo"]');
+  await cards.first().waitFor({ state: "visible", timeout: 18_000 });
+  return cards;
+}
+
+async function readCards(cards: Awaited<ReturnType<typeof resultCards>>) {
+  return cards.evaluateAll((nodes) => nodes.map((node) => {
+    let current: Element | null = node;
+    let text = "";
+    let logoUrl: string | null = null;
+    for (let depth = 0; current && depth < 6; depth++, current = current.parentElement) {
+      const candidate = current.textContent ?? "";
+      if (/\d{1,2}:\d{2}/.test(candidate) && /COP|pesos colombianos|\$/.test(candidate)) {
+        text = candidate;
+        const images = [...current.querySelectorAll("img")];
+        const label = (node.getAttribute("aria-label") ?? "").toLocaleLowerCase();
+        const hasSecureSource = (image: HTMLImageElement) => /^https:\/\//i.test(image.currentSrc || image.src);
+        const logo = images.find((image) => hasSecureSource(image) && Boolean(image.alt?.trim()) && (label.includes(image.alt.toLocaleLowerCase()) || candidate.toLocaleLowerCase().includes(image.alt.toLocaleLowerCase())))
+          ?? images.find((image) => hasSecureSource(image) && Boolean(image.alt?.trim()))
+          ?? images.find(hasSecureSource);
+        logoUrl = logo ? (logo.currentSrc || logo.src) : null;
+        break;
+      }
+    }
+    return { label: node.getAttribute("aria-label") ?? "", text, logoUrl };
+  }));
+}
+
+async function getOneWayOptions(page: Page, threshold: number): Promise<FlightItineraryOption[]> {
+  const cards = await resultCards(page);
+  const raw = await readCards(cards);
+  const found: FlightItineraryOption[] = [];
+  raw.forEach((item) => {
+    const card = parseGoogleFlightCard(item.label, item.text, item.logoUrl);
+    if (!card || card.amount > threshold) return;
+    found.push({ outboundAirline: card.airline, outboundLogoUrl: card.logoUrl, outboundOperatedBy: card.operatedBy,
+      inboundAirline: null, inboundLogoUrl: null, inboundOperatedBy: null, outboundDepartureTime: card.departureTime,
+      outboundArrivalTime: card.arrivalTime, inboundDepartureTime: null, inboundArrivalTime: null,
+      amount: card.amount, currency: card.currency, outboundStops: card.stops, inboundStops: null,
+      separateTickets: card.separateTickets });
+  });
+  return found;
+}
+
+async function getRoundTripOptions(page: Page, threshold: number): Promise<FlightItineraryOption[]> {
+  const outboundCards = await resultCards(page);
+  const outboundRaw = await readCards(outboundCards);
+  const collected: FlightItineraryOption[] = [];
+  for (let index = 0; index < outboundRaw.length; index++) {
+    const outbound = parseGoogleFlightCard(outboundRaw[index].label, outboundRaw[index].text, outboundRaw[index].logoUrl);
+    // Google displays the cheapest round-trip total associated with this outbound.
+    // If that lower bound is above the alert threshold, no return can qualify.
+    if (!outbound || outbound.amount > threshold) continue;
+    const departure = outbound.departureTime;
+    const [clock, meridiem] = departure.split(/\s+/);
+    const flexibleMeridiem = meridiem?.replaceAll(".", "\\.").replace(/\s+/g, "\\s*") ?? "";
+    const matching = outboundCards.nth(index).getByText(new RegExp(`${clock}\\s*${flexibleMeridiem}`, "i")).first();
+    await matching.click({ timeout: 8_000 });
+    await page.waitForTimeout(900);
+    let returnCards;
+    try {
+      returnCards = await resultCards(page);
+    } catch {
+      const change = page.getByRole("button", { name: /cambiar el vuelo de ida/i });
+      if (await change.count()) await change.click();
+      continue;
+    }
+    const returnRaw = await readCards(returnCards);
+    for (const item of returnRaw) {
+      const inbound = parseGoogleFlightCard(item.label, item.text, item.logoUrl);
+      if (!inbound || inbound.amount > threshold) continue;
+      collected.push({ outboundAirline: outbound.airline, outboundLogoUrl: outbound.logoUrl, outboundOperatedBy: outbound.operatedBy,
+        inboundAirline: inbound.airline, inboundLogoUrl: inbound.logoUrl, inboundOperatedBy: inbound.operatedBy,
+        outboundDepartureTime: outbound.departureTime, outboundArrivalTime: outbound.arrivalTime,
+        inboundDepartureTime: inbound.departureTime, inboundArrivalTime: inbound.arrivalTime,
+        amount: inbound.amount, currency: inbound.currency, outboundStops: outbound.stops,
+        inboundStops: inbound.stops, separateTickets: outbound.separateTickets || inbound.separateTickets });
+    }
+    const change = page.getByRole("button", { name: /cambiar el vuelo de ida/i });
+    if (await change.count()) {
+      await change.click();
+      await page.waitForTimeout(500);
+    } else break;
+  }
+  const unique = new Map<string, FlightItineraryOption>();
+  for (const option of collected) unique.set(JSON.stringify(option), option);
+  return [...unique.values()];
+}
+
+async function fetchFlightOptions(page: Page, followUp: FollowUp, result: FlightPriceResult) {
+  try {
+    // Start from the same clean search form for each qualifying calendar fare.
+    // Google replaces the date inputs with compact date controls after results load.
+    await page.goto(FLIGHTS_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    await page.getByRole("combobox", { name: /¿Desde dónde\?/i }).waitFor({ state: "visible", timeout: 20_000 });
+    await prepareForm(page, followUp);
+    await openCalendar(page, "Salida");
+    await selectCalendarDate(page, result.outboundDate);
+    if (followUp.tripType === "round_trip" && result.inboundDate) await selectCalendarDate(page, result.inboundDate);
+    await closeCalendar(page);
+    const search = page.getByRole("button", { name: /^buscar$/i });
+    await search.waitFor({ state: "visible", timeout: 10_000 });
+    await search.click();
+    await page.waitForTimeout(1_500);
+    const options = followUp.tripType === "one_way"
+      ? await getOneWayOptions(page, followUp.maxPriceCop)
+      : await getRoundTripOptions(page, followUp.maxPriceCop);
+    return { ...result, flightOptions: options, flightDetailsStatus: options.length ? "available" as const : "unavailable" as const };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message.slice(0, 240) : "Error no identificado";
+    return { ...result, details: [result.details, `No se pudo obtener el detalle de vuelos: ${reason}`].filter(Boolean).join(" "), flightOptions: [], flightDetailsStatus: "unavailable" as const };
+  }
+}
+
 export async function scanGoogleFlights(followUp: FollowUp): Promise<FlightPriceResult[]> {
   let browser: Browser | null = null;
   try {
@@ -165,7 +282,14 @@ export async function scanGoogleFlights(followUp: FollowUp): Promise<FlightPrice
       }
       await closeCalendar(page);
     }
-    return results.map((result) => ({ ...result, meetsThreshold: result.amount !== null && result.amount <= followUp.maxPriceCop }));
+    const thresholdResults = results.map((result) => ({ ...result, meetsThreshold: result.amount !== null && result.amount <= followUp.maxPriceCop }));
+    const qualifying = thresholdResults.filter((result) => result.meetsThreshold && result.amount !== null && result.currency === "COP");
+    for (const result of qualifying) {
+      const detailed = await fetchFlightOptions(page, followUp, result);
+      const index = thresholdResults.indexOf(result);
+      thresholdResults[index] = detailed;
+    }
+    return thresholdResults;
   } catch (error) {
     if (error instanceof Error) throw error;
     throw new Error("Fallo desconocido al consultar Google Flights.");

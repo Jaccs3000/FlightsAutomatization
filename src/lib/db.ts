@@ -100,6 +100,7 @@ async function openDatabase() {
       created_at VARCHAR NOT NULL
     )
   `);
+  await connection.run("ALTER TABLE run_results ADD COLUMN IF NOT EXISTS flight_options_json VARCHAR");
   await connection.run(`
     CREATE TABLE IF NOT EXISTS email_notifications (
       id VARCHAR PRIMARY KEY,
@@ -345,12 +346,12 @@ export async function finishRun(data: { id: string; status: RunStatus; finishedA
     try {
       for (const result of data.results) {
         await connection.run(`
-          INSERT INTO run_results (id, run_id, outbound_date, inbound_date, amount, currency, comparable, meets_threshold, observed_text, details, created_at)
-          VALUES ($id, $run_id, $outbound_date, $inbound_date, $amount, $currency, $comparable, $meets_threshold, $observed_text, $details, $created_at)
+          INSERT INTO run_results (id, run_id, outbound_date, inbound_date, amount, currency, comparable, meets_threshold, observed_text, details, flight_options_json, created_at)
+          VALUES ($id, $run_id, $outbound_date, $inbound_date, $amount, $currency, $comparable, $meets_threshold, $observed_text, $details, $flight_options_json, $created_at)
         `, {
           id: crypto.randomUUID(), run_id: data.id, outbound_date: result.outboundDate, inbound_date: result.inboundDate,
           amount: result.amount, currency: result.currency, comparable: result.comparable, meets_threshold: result.meetsThreshold,
-          observed_text: result.observedText, details: result.details, created_at: data.finishedAt,
+          observed_text: result.observedText, details: result.details, flight_options_json: result.flightDetailsStatus ? JSON.stringify(result.flightOptions ?? []) : null, created_at: data.finishedAt,
         } as never);
       }
       await connection.run(`
@@ -411,11 +412,14 @@ export async function listRuns(limit = 100): Promise<RunWithResults[]> {
   for (const row of resultRows) {
     const runId = asString(row.run_id);
     const bucket = resultsByRun.get(runId) ?? [];
+    const flightOptions = parseFlightOptions(row.flight_options_json);
     bucket.push({
       outboundDate: asString(row.outbound_date), inboundDate: asNullableString(row.inbound_date),
       amount: row.amount == null ? null : asNumber(row.amount), currency: asNullableString(row.currency),
       comparable: asBoolean(row.comparable), meetsThreshold: asBoolean(row.meets_threshold),
       observedText: asString(row.observed_text), details: asNullableString(row.details),
+      flightOptions,
+      flightDetailsStatus: row.flight_options_json == null ? undefined : flightOptions?.length ? "available" : "unavailable",
     });
     resultsByRun.set(runId, bucket);
   }
@@ -435,6 +439,14 @@ export async function listRuns(limit = 100): Promise<RunWithResults[]> {
     results: resultsByRun.get(asString(row.id)) ?? [],
   };
   });
+}
+
+function parseFlightOptions(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch { return undefined; }
 }
 
 function parseFollowUpSnapshot(value: string): FollowUp | null {
