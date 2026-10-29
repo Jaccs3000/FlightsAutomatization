@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Iniciando Vuela</title>
+    <style>
+      :root { color-scheme: light; font-family: "Segoe UI", Arial, sans-serif; color: #25372d; background: #f4f7f3; }
+      * { box-sizing: border-box; }
+      body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px; }
+      main { width: min(100%, 420px); padding: 36px; text-align: center; background: white; border: 1px solid #e1e9e1; border-radius: 22px; box-shadow: 0 16px 45px #203b2812; }
+      .mark { width: 52px; height: 52px; margin: 0 auto 18px; display: grid; place-items: center; border-radius: 16px; color: white; background: #18835f; font-size: 24px; }
+      h1 { margin: 0; font-size: 24px; letter-spacing: -.04em; }
+      p { margin: 10px 0 0; color: #708078; font-size: 14px; line-height: 1.6; }
+      .spinner { width: 22px; height: 22px; margin: 24px auto 0; border: 3px solid #dce9df; border-top-color: #18835f; border-radius: 50%; animation: spin .8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">✈</div>
+      <h1>Iniciando Vuela</h1>
+      <p>La aplicación se abrirá en esta pestaña en cuanto el servicio esté listo.</p>
+      <div class="spinner" aria-label="Cargando"></div>
+    </main>
+    <script>
+      const appUrl = "http://127.0.0.1:3030";
+      async function waitForApp() {
+        try {
+          await fetch(`${appUrl}/api/lifecycle/health?check=${Date.now()}`, { mode: "no-cors", cache: "no-store" });
+          window.location.replace(appUrl);
+        } catch {
+          window.setTimeout(waitForApp, 800);
+        }
+      }
+      waitForApp();
+    </script>
+  </body>
+</html>

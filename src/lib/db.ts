@@ -67,6 +67,11 @@ async function openDatabase() {
       updated_at VARCHAR NOT NULL
     )
   `);
+  await connection.run("ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS destination_iatas_json VARCHAR");
+  await connection.run("ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'standard'");
+  await connection.run("ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS lookahead_days INTEGER DEFAULT 120");
+  await connection.run("ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS min_notice_hours INTEGER DEFAULT 8");
+  await connection.run("UPDATE follow_ups SET destination_iatas_json = to_json([destination_iata]) WHERE destination_iatas_json IS NULL");
   await connection.run(`
     CREATE TABLE IF NOT EXISTS runs (
       id VARCHAR PRIMARY KEY,
@@ -97,10 +102,16 @@ async function openDatabase() {
       meets_threshold BOOLEAN NOT NULL,
       observed_text VARCHAR NOT NULL,
       details VARCHAR,
+      is_calendar_minimum BOOLEAN NOT NULL DEFAULT false,
       created_at VARCHAR NOT NULL
     )
   `);
   await connection.run("ALTER TABLE run_results ADD COLUMN IF NOT EXISTS flight_options_json VARCHAR");
+  await connection.run("ALTER TABLE run_results ADD COLUMN IF NOT EXISTS flight_details_status VARCHAR");
+  await connection.run("ALTER TABLE run_results ADD COLUMN IF NOT EXISTS destination_iata VARCHAR");
+  // DuckDB does not permit NOT NULL on an added column in this migration form.
+  // Existing rows may keep NULL and are treated as false by the row mapper.
+  await connection.run("ALTER TABLE run_results ADD COLUMN IF NOT EXISTS is_calendar_minimum BOOLEAN DEFAULT false");
   await connection.run(`
     CREATE TABLE IF NOT EXISTS email_notifications (
       id VARCHAR PRIMARY KEY,
@@ -172,9 +183,16 @@ function asBoolean(value: unknown): boolean {
 }
 
 function toFollowUp(row: DbRow): FollowUp {
+  let destinationIatas: string[] = [asString(row.destination_iata)];
+  try {
+    const parsed = JSON.parse(asString(row.destination_iatas_json, "[]"));
+    if (Array.isArray(parsed) && parsed.length) destinationIatas = parsed as string[];
+  } catch { /* Legacy rows retain their single destination. */ }
   return {
     id: asString(row.id), name: asString(row.name), originIata: asString(row.origin_iata),
-    destinationIata: asString(row.destination_iata), tripType: asString(row.trip_type) as FollowUp["tripType"],
+    destinationIata: asString(row.destination_iata), destinationIatas,
+    mode: asString(row.mode, "standard") as FollowUp["mode"], lookaheadDays: asNumber(row.lookahead_days ?? 120),
+    minNoticeHours: asNumber(row.min_notice_hours ?? 8), tripType: asString(row.trip_type) as FollowUp["tripType"],
     outboundMode: asString(row.outbound_mode) as FollowUp["outboundMode"], outboundStart: asString(row.outbound_start),
     outboundEnd: asNullableString(row.outbound_end), inboundMode: asNullableString(row.inbound_mode) as FollowUp["inboundMode"],
     inboundStart: asNullableString(row.inbound_start), inboundEnd: asNullableString(row.inbound_end),
@@ -203,12 +221,15 @@ export async function saveFollowUp(input: FollowUpInput, existingId?: string): P
   const existing = existingId ? await getFollowUp(existingId) : null;
   await exec(`
     INSERT OR REPLACE INTO follow_ups
-      (id, name, origin_iata, destination_iata, trip_type, outbound_mode, outbound_start, outbound_end,
+      (id, name, origin_iata, destination_iata, destination_iatas_json, mode, lookahead_days, min_notice_hours, trip_type, outbound_mode, outbound_start, outbound_end,
        inbound_mode, inbound_start, inbound_end, stay_nights, adults, max_price_cop, status, created_at, updated_at)
-    VALUES ($id, $name, $origin_iata, $destination_iata, $trip_type, $outbound_mode, $outbound_start, $outbound_end,
+    VALUES ($id, $name, $origin_iata, $destination_iata, $destination_iatas_json, $mode, $lookahead_days, $min_notice_hours, $trip_type, $outbound_mode, $outbound_start, $outbound_end,
        $inbound_mode, $inbound_start, $inbound_end, $stay_nights, $adults, $max_price_cop, $status, $created_at, $updated_at)
   `, {
     id, name: input.name, origin_iata: input.originIata, destination_iata: input.destinationIata,
+    destination_iatas_json: JSON.stringify(input.mode === "weekend_escape" ? input.destinationIatas ?? [input.destinationIata] : [input.destinationIata]),
+    mode: input.mode ?? "standard", lookahead_days: input.mode === "weekend_escape" ? input.lookaheadDays ?? 120 : 120,
+    min_notice_hours: input.mode === "weekend_escape" ? input.minNoticeHours ?? 8 : 8,
     trip_type: input.tripType, outbound_mode: input.outboundMode, outbound_start: input.outboundStart,
     outbound_end: input.outboundMode === "flexible" ? input.outboundEnd ?? null : null,
     inbound_mode: input.tripType === "round_trip" ? input.inboundMode ?? null : null,
@@ -316,11 +337,11 @@ export async function appendDiagnosticLog(entry: Omit<DiagnosticLog, "id" | "cre
     id: crypto.randomUUID(), created_at: createdAt, area: entry.area, event: entry.event,
     outcome: entry.outcome, message: entry.message.slice(0, 500),
   });
-  await exec("DELETE FROM diagnostic_logs WHERE id NOT IN (SELECT id FROM diagnostic_logs ORDER BY created_at DESC, id DESC LIMIT 500)");
+  await exec("DELETE FROM diagnostic_logs WHERE id NOT IN (SELECT id FROM diagnostic_logs ORDER BY created_at DESC, id DESC LIMIT 5000)");
 }
 
 export async function listDiagnosticLogs(limit = 200): Promise<DiagnosticLog[]> {
-  const result = await rows("SELECT id, created_at, area, event, outcome, message FROM diagnostic_logs ORDER BY created_at DESC, id DESC LIMIT $limit", { limit: Math.min(500, Math.max(1, Math.trunc(limit))) });
+  const result = await rows("SELECT id, created_at, area, event, outcome, message FROM diagnostic_logs ORDER BY created_at DESC, id DESC LIMIT $limit", { limit: Math.min(5000, Math.max(1, Math.trunc(limit))) });
   return result.map((row) => ({
     id: asString(row.id), createdAt: asString(row.created_at), area: asString(row.area),
     event: asString(row.event), outcome: asString(row.outcome) as DiagnosticLog["outcome"], message: asString(row.message),
@@ -346,12 +367,14 @@ export async function finishRun(data: { id: string; status: RunStatus; finishedA
     try {
       for (const result of data.results) {
         await connection.run(`
-          INSERT INTO run_results (id, run_id, outbound_date, inbound_date, amount, currency, comparable, meets_threshold, observed_text, details, flight_options_json, created_at)
-          VALUES ($id, $run_id, $outbound_date, $inbound_date, $amount, $currency, $comparable, $meets_threshold, $observed_text, $details, $flight_options_json, $created_at)
+          INSERT INTO run_results (id, run_id, outbound_date, inbound_date, amount, currency, comparable, meets_threshold, observed_text, details, flight_options_json, flight_details_status, destination_iata, is_calendar_minimum, created_at)
+          VALUES ($id, $run_id, $outbound_date, $inbound_date, $amount, $currency, $comparable, $meets_threshold, $observed_text, $details, $flight_options_json, $flight_details_status, $destination_iata, $is_calendar_minimum, $created_at)
         `, {
           id: crypto.randomUUID(), run_id: data.id, outbound_date: result.outboundDate, inbound_date: result.inboundDate,
           amount: result.amount, currency: result.currency, comparable: result.comparable, meets_threshold: result.meetsThreshold,
           observed_text: result.observedText, details: result.details, flight_options_json: result.flightDetailsStatus ? JSON.stringify(result.flightOptions ?? []) : null, created_at: data.finishedAt,
+          flight_details_status: result.flightDetailsStatus ?? null, destination_iata: result.destinationIata ?? null,
+          is_calendar_minimum: result.isCalendarMinimum ?? false,
         } as never);
       }
       await connection.run(`
@@ -366,6 +389,18 @@ export async function finishRun(data: { id: string; status: RunStatus; finishedA
       await connection.run("ROLLBACK");
       throw error;
     }
+  });
+}
+
+export async function cancelRun(id: string, finishedAt = new Date().toISOString()): Promise<boolean> {
+  return enqueue(async () => {
+    const { connection } = await db();
+    const rows = await connection.runAndReadAll("SELECT status FROM runs WHERE id = $id", { id });
+    const row = rows.getRowObjects()[0] as Record<string, unknown> | undefined;
+    if (!row || row.status !== "running") return false;
+    await connection.run(`UPDATE runs SET status = 'cancelled', finished_at = $finished_at,
+      error = 'Ejecución detenida por el usuario.', notification_status = 'not_needed' WHERE id = $id AND status = 'running'`, { id, finished_at: finishedAt } as never);
+    return true;
   });
 }
 
@@ -418,8 +453,10 @@ export async function listRuns(limit = 100): Promise<RunWithResults[]> {
       amount: row.amount == null ? null : asNumber(row.amount), currency: asNullableString(row.currency),
       comparable: asBoolean(row.comparable), meetsThreshold: asBoolean(row.meets_threshold),
       observedText: asString(row.observed_text), details: asNullableString(row.details),
+      destinationIata: asNullableString(row.destination_iata) ?? undefined,
+      isCalendarMinimum: asBoolean(row.is_calendar_minimum),
       flightOptions,
-      flightDetailsStatus: row.flight_options_json == null ? undefined : flightOptions?.length ? "available" : "unavailable",
+      flightDetailsStatus: (asNullableString(row.flight_details_status) as FlightPriceResult["flightDetailsStatus"]) ?? (row.flight_options_json == null ? undefined : flightOptions?.length ? "available" : "unavailable"),
     });
     resultsByRun.set(runId, bucket);
   }
@@ -438,6 +475,25 @@ export async function listRuns(limit = 100): Promise<RunWithResults[]> {
     notificationError: notification ? asNullableString(notification.error) : null,
     results: resultsByRun.get(asString(row.id)) ?? [],
   };
+  });
+}
+
+export async function clearHistory(): Promise<number> {
+  return enqueue(async () => {
+    const { connection } = await db();
+    await connection.run("BEGIN TRANSACTION");
+    try {
+      const countRows = await connection.runAndReadAll("SELECT count(*) AS count FROM runs");
+      const count = asNumber((countRows.getRowObjectsJS()[0] as DbRow | undefined)?.count);
+      await connection.run("DELETE FROM run_results");
+      await connection.run("DELETE FROM email_notifications");
+      await connection.run("DELETE FROM runs");
+      await connection.run("COMMIT");
+      return count;
+    } catch (error) {
+      await connection.run("ROLLBACK");
+      throw error;
+    }
   });
 }
 

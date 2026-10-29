@@ -1,12 +1,98 @@
 import { chromium, type Browser, type Page } from "playwright";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import type { FlightPriceResult, FollowUp } from "./types";
-import { dateRange, validRoundTripPairs } from "./dates";
+import { dateRange, daysBetween, validRoundTripPairs, weekendEscapeCandidates } from "./dates";
 import { parsePrice } from "./prices";
 import { parseGoogleFlightCard } from "./google-flights-parser";
 import type { FlightItineraryOption } from "./types";
 
+type FlightBrowserGlobal = typeof globalThis & { __vuelaFlightBrowsers?: Map<string, Browser>; __vuelaStoppedRunIds?: Set<string> };
+const flightGlobal = globalThis as FlightBrowserGlobal;
+const flightBrowsers = flightGlobal.__vuelaFlightBrowsers ??= new Map<string, Browser>();
+const stoppedRunIds = flightGlobal.__vuelaStoppedRunIds ??= new Set<string>();
+
+export type SearchProgress = {
+  phase: string;
+  completed: number;
+  total: number;
+  current?: string;
+  destinationProgress?: Array<{ destinationIata: string; completed: number; total: number }>;
+};
+export type SearchProgressCallback = (progress: SearchProgress) => void;
+
+type RunScreenshotContext = { directory: string; sequence: number; manifest: Array<{ file: string; label: string; capturedAt: string; url: string }> };
+
+function safeScreenshotName(value: string) {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 90) || "pantalla";
+}
+
+async function captureRunScreen(page: Page, context: RunScreenshotContext | null | undefined, label: string) {
+  if (!context) return;
+  const file = `${String(++context.sequence).padStart(4, "0")}_${safeScreenshotName(label)}.png`;
+  try {
+    await page.screenshot({ path: path.join(context.directory, file), fullPage: false, animations: "disabled", timeout: 15_000 });
+    context.manifest.push({ file, label, capturedAt: new Date().toISOString(), url: page.url().split("?")[0] });
+    await writeFile(path.join(context.directory, "capturas.json"), JSON.stringify(context.manifest, null, 2), "utf8");
+  } catch (error) {
+    // A screenshot must never break or cancel a flight search.
+    context.manifest.push({ file: "", label: `${label} (falló captura: ${error instanceof Error ? error.message : "error"})`, capturedAt: new Date().toISOString(), url: page.url().split("?")[0] });
+  }
+}
+
+export async function stopGoogleFlightsRun(runId: string) {
+  stoppedRunIds.add(runId);
+  const browser = flightBrowsers.get(runId);
+  if (browser) await browser.close().catch(() => undefined);
+}
+
 const FLIGHTS_URL = "https://www.google.com/travel/flights?hl=es-419&gl=CO&curr=COP";
 export const MAX_COMBINATIONS = 50;
+export const MAX_WEEKEND_ESCAPE_COMBINATIONS = 200;
+
+const colombianAirportCodes = new Set(["BOG", "MDE", "CLO", "CTG", "BAQ", "BGA", "SMR", "ADZ", "PEI", "CUC", "NVA", "VVC", "AXM", "EOH", "IBE", "MTR", "RCH", "UIB", "PSO", "LET", "APO", "CRC", "GPI", "TCO", "FLA", "CVE", "MZL", "PDA", "EJA", "CQT", "PPN", "SJE", "GUA"]);
+const airportTimeZones: Record<string, string> = {
+  JFK: "America/New_York", EWR: "America/New_York", LGA: "America/New_York", MIA: "America/New_York", ATL: "America/New_York", BOS: "America/New_York", IAD: "America/New_York", DCA: "America/New_York", MCO: "America/New_York", FLL: "America/New_York", YYZ: "America/Toronto", YUL: "America/Toronto", YVR: "America/Vancouver", LAX: "America/Los_Angeles", SFO: "America/Los_Angeles", SEA: "America/Los_Angeles", DEN: "America/Denver", DFW: "America/Chicago", ORD: "America/Chicago", IAH: "America/Chicago", MEX: "America/Mexico_City", CUN: "America/Cancun", SJO: "America/Costa_Rica", PTY: "America/Panama", LIM: "America/Lima", UIO: "America/Guayaquil", GYE: "America/Guayaquil", CCS: "America/Caracas", GRU: "America/Sao_Paulo", GIG: "America/Sao_Paulo", EZE: "America/Argentina/Buenos_Aires", SCL: "America/Santiago", MAD: "Europe/Madrid", BCN: "Europe/Madrid", LHR: "Europe/London", CDG: "Europe/Paris", AMS: "Europe/Amsterdam", FRA: "Europe/Berlin", FCO: "Europe/Rome", LIS: "Europe/Lisbon", MUC: "Europe/Berlin", IST: "Europe/Istanbul", DXB: "Asia/Dubai", DOH: "Asia/Qatar", DEL: "Asia/Kolkata", BOM: "Asia/Kolkata", SIN: "Asia/Singapore", HKG: "Asia/Hong_Kong", NRT: "Asia/Tokyo", HND: "Asia/Tokyo", SYD: "Australia/Sydney",
+};
+
+export function airportTimeZone(iata: string): string {
+  const known = airportTimeZones[iata.toUpperCase()];
+  if (known) return known;
+  if (colombianAirportCodes.has(iata.toUpperCase())) return "America/Bogota";
+  throw new Error(`No hay zona horaria configurada para el aeropuerto de origen ${iata}; no es posible validar con precisión la anticipación mínima.`);
+}
+
+export function timeTextToMinutes(value: string): number | null {
+  const match = value.match(/(\d{1,2}):(\d{2})\s*(a\.?\s*m\.?|p\.?\s*m\.?)/i);
+  if (!match) return null;
+  const hour = Number(match[1]), minute = Number(match[2]), pm = /^p/i.test(match[3]);
+  if (hour < 1 || hour > 12 || minute > 59) return null;
+  return ((hour % 12) + (pm ? 12 : 0)) * 60 + minute;
+}
+
+export function isTimeInWindow(value: string, start: number, end: number): boolean {
+  const minutes = timeTextToMinutes(value);
+  return minutes !== null && minutes >= start && minutes <= end;
+}
+
+function localDepartureEpoch(date: string, time: string, timeZone: string): number | null {
+  const minutes = timeTextToMinutes(time);
+  if (minutes === null) return null;
+  const target = Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10)), Math.floor(minutes / 60), minutes % 60);
+  let guess = target;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(guess));
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    const represented = Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day), Number(values.hour), Number(values.minute));
+    guess += target - represented;
+  }
+  return guess;
+}
+
+export function hasMinimumNotice(date: string, time: string, timeZone: string, minimumHours: number, now = Date.now()): boolean {
+  const departure = localDepartureEpoch(date, time, timeZone);
+  return departure !== null && departure - now >= minimumHours * 3_600_000;
+}
 
 
 async function chooseAirport(page: Page, fieldLabel: RegExp, code: string) {
@@ -62,77 +148,194 @@ async function chooseAdults(page: Page, adults: number) {
   if (await done.count()) await done.click();
 }
 
-async function parseCalendarPrices(page: Page, targets: string[], field: "Salida" | "Regreso"): Promise<FlightPriceResult[]> {
+async function parseCalendarPrices(page: Page, targets: string[], field: "Salida" | "Regreso", onUnparsedTargets?: (summary: string) => void, targetWaitSeconds = 4, screenshots?: RunScreenshotContext | null): Promise<FlightPriceResult[]> {
   const dialog = await openCalendar(page, field);
+  await captureRunScreen(page, screenshots, `calendario-${field.toLowerCase()}-lectura-${targets[0] ?? "fechas"}`);
   const output = new Map<string, FlightPriceResult>();
-  // Google shows two calendar months at once. A 31-day range beginning at
-  // the end of a month can extend into a third month, so collect each visible
-  // month before deciding that a date has no price.
-  for (let pageIndex = 0; pageIndex < 3; pageIndex++) {
-    const cells = await dialog.locator("[role='button']").evaluateAll((items) => items.map((item) => {
-      const label = item.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "";
-      return { label, text: item.textContent ?? "" };
-    }));
+  type CalendarCell = { label: string; text: string; parentText: string; left: number; top: number; right: number; bottom: number };
+  const readCells = (): Promise<CalendarCell[]> => dialog.locator("[role='button']").evaluateAll((items) => items.map((item) => {
+    const label = item.getAttribute("aria-label") ?? item.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "";
+    const rect = item.getBoundingClientRect();
+    const parent = item.parentElement;
+    return { label, text: (item as HTMLElement).innerText ?? item.textContent ?? "", parentText: (parent as HTMLElement | null)?.innerText ?? "", left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+  }));
+  const dialogBox = await dialog.boundingBox();
+  if (!dialogBox) return [];
+  const isInViewport = (cell: CalendarCell) => cell.right > dialogBox.x + 2 && cell.left < dialogBox.x + dialogBox.width - 2 && cell.bottom > dialogBox.y + 70 && cell.top < dialogBox.y + dialogBox.height - 55;
+  const collectVisibleTargets = (cells: CalendarCell[]) => {
     for (const target of targets) {
       if (output.has(target)) continue;
-      const cell = cells.find((item) => item.label.startsWith(calendarDateLabel(target)));
+      const cell = cells.find((item) => item.label.startsWith(calendarDateLabel(target)) && isInViewport(item));
       if (!cell) continue;
       const price = parsePrice(cell.text);
-      if (price) output.set(target, { outboundDate: target, inboundDate: null, amount: price.amount, currency: price.currency, comparable: price.currency === "COP", meetsThreshold: false, observedText: cell.text.trim(), details: price.currency === "COP" ? null : "El calendario mostr\u00f3 una moneda distinta de COP; se conserva en el historial sin conversi\u00f3n." });
+      if (price) output.set(target, { outboundDate: target, inboundDate: null, amount: price.amount, currency: price.currency, comparable: price.currency === "COP", meetsThreshold: false, observedText: cell.text.trim(), details: price.currency === "COP" ? null : "El calendario mostró una moneda distinta de COP; se conserva en el historial sin conversión." });
     }
-    const visibleDates = new Set(targets.filter((target) => cells.some((item) => item.label.startsWith(calendarDateLabel(target)))));
-    if (visibleDates.size === targets.length || pageIndex === 2) break;
-    const next = page.getByRole("button", { name: /^siguiente$/i }).last();
+  };
+
+  // Total return prices often arrive several seconds after selecting the outbound date.
+  // Wait for the requested visible dates, not merely any fare elsewhere in the
+  // calendar; unrelated fares can render before the target day's price.
+  for (let attempt = 0; attempt < targetWaitSeconds; attempt++) {
+    const cells = await readCells();
+    collectVisibleTargets(cells);
+    const visibleTargets = targets.filter((target) => cells.some((cell) => cell.label.startsWith(calendarDateLabel(target)) && isInViewport(cell)));
+    const targetPricesLoaded = visibleTargets.length > 0 && visibleTargets.every((target) => output.has(target));
+    if (targetPricesLoaded || visibleTargets.length === 0 || attempt === targetWaitSeconds - 1) break;
+    await page.waitForTimeout(1_000);
+  }
+
+  // Google keeps future month cells in the DOM before displaying them. Their
+  // fare text is only loaded once the calendar is advanced to that month.
+  for (let pageIndex = 0; pageIndex < 14; pageIndex++) {
+    let cells = await readCells();
+    collectVisibleTargets(cells);
+    const visibleTargets = new Set(targets.filter((target) => cells.some((cell) => cell.label.startsWith(calendarDateLabel(target)) && isInViewport(cell))));
+    if (visibleTargets.size === targets.length || pageIndex === 5) break;
+    const previousMonthSignature = cells.filter(isInViewport).map((cell) => cell.label).join("|");
+    // Google varies this accessible name between "Siguiente", "Siguiente mes"
+    // and English "Next month". Scope navigation to the calendar dialog so
+    // date arrows elsewhere on the flight form cannot be mistaken for it.
+    const next = dialog.getByRole("button", { name: /siguiente|pr[oó]ximo|next/i }).last();
     if (!(await next.count()) || !(await next.isVisible().catch(() => false))) break;
     await next.click();
-    await page.waitForTimeout(180);
+    // Wait briefly for the month transition. Don't spend the fare-loading
+    // timeout on intermediate months that do not contain any requested date.
+    let monthChanged = false;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      cells = await readCells();
+      const signature = cells.filter(isInViewport).map((cell) => cell.label).join("|");
+      if (signature && signature !== previousMonthSignature) { monthChanged = true; break; }
+      await page.waitForTimeout(100);
+    }
+    if (!monthChanged) continue;
+    await captureRunScreen(page, screenshots, `calendario-${field.toLowerCase()}-mes-${pageIndex + 2}-${targets[0] ?? "fechas"}`);
+    collectVisibleTargets(cells);
+    const targetDatesInMonth = targets.filter((target) => cells.some((cell) => cell.label.startsWith(calendarDateLabel(target)) && isInViewport(cell)));
+    if (targetDatesInMonth.length === 0) continue;
+    // Wait for target fares only once a requested month is visible.
+    for (let attempt = 0; attempt < targetWaitSeconds; attempt++) {
+      await page.waitForTimeout(1_000);
+      cells = await readCells();
+      collectVisibleTargets(cells);
+      const nowVisible = new Set(targets.filter((target) => cells.some((cell) => cell.label.startsWith(calendarDateLabel(target)) && isInViewport(cell))));
+      if (nowVisible.size > 0 && [...nowVisible].every((target) => output.has(target))) break;
+    }
+  }
+  const missingTargets = targets.filter((target) => !output.has(target));
+  if (missingTargets.length && onUnparsedTargets) {
+    const finalCells = await readCells();
+    const selectedFields = await page.locator("input").evaluateAll((items) => items.map((item) => `${item.getAttribute("placeholder") ?? item.getAttribute("aria-label") ?? "input"}=${(item as HTMLInputElement).value}`).join(" | "));
+    const summaries = missingTargets.map((target) => {
+      const expectedLabel = calendarDateLabel(target);
+      const candidate = finalCells.find((cell) => cell.label.startsWith(expectedLabel));
+      return candidate
+        ? `${target}: celda="${candidate.label}" texto="${candidate.text.trim().slice(0, 100)}" contenedor="${candidate.parentText.trim().slice(0, 140)}" campos="${selectedFields.slice(0, 240)}"`
+        : `${target}: fecha no visible; etiquetas visibles=${finalCells.filter(isInViewport).slice(0, 8).map((cell) => cell.label || "sin aria-label").join(" | ")}`;
+    });
+    onUnparsedTargets(summaries.join("; "));
   }
   return [...output.values()];
 }
-
 async function openCalendar(page: Page, field: "Salida" | "Regreso" = "Salida") {
   const currentDialog = page.getByRole("dialog").last();
   if (await currentDialog.count() && await currentDialog.isVisible().catch(() => false)) {
-    await page.waitForTimeout(1_500);
     return currentDialog;
   }
   const input = page.getByPlaceholder(field, { exact: true }).first();
   if (!(await input.count())) throw new Error(`No aparece el campo ${field} en Google Flights.`);
   await input.click();
-  await page.waitForTimeout(1_500);
-  return page.getByRole("dialog").last();
+  const dialog = page.getByRole("dialog").last();
+  await dialog.waitFor({ state: "visible", timeout: 10_000 });
+  return dialog;
 }
 
 async function closeCalendar(page: Page) {
-  const done = page.getByRole("button", { name: /^listo$/i }).last();
-  if (await done.count() && await done.isVisible().catch(() => false)) await done.click();
+  // The footer action varies between locales/layouts ("Listo", "Hecho" and
+  // "Done"). Search only inside the date dialog to avoid unrelated controls.
+  const dialog = page.getByRole("dialog").last();
+  if (!(await dialog.count()) || !(await dialog.isVisible().catch(() => false))) return;
+  const done = dialog.getByRole("button", { name: /listo|hecho|done/i }).last();
+  if (await done.count() && await done.isVisible().catch(() => false)) {
+    await done.click();
+    await page.getByRole("dialog").last().waitFor({ state: "hidden", timeout: 5_000 }).catch(() => undefined);
+  }
 }
 
 function calendarDateLabel(date: string) {
   return new Date(`${date}T00:00:00Z`).toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
 }
 
-async function selectCalendarDate(page: Page, date: string) {
-  const day = page.locator(`[aria-label=${JSON.stringify(calendarDateLabel(date))}]`).first();
-  await day.waitFor({ state: "visible", timeout: 12_000 });
-  await day.click();
-  await page.waitForTimeout(1_500);
+async function selectCalendarDate(page: Page, date: string, screenshots?: RunScreenshotContext | null) {
+  const selector = `[aria-label^=${JSON.stringify(calendarDateLabel(date))}]`;
+  const dialog = page.getByRole("dialog").last();
+  for (let month = 0; month < 14; month++) {
+    const day = dialog.locator(selector).last();
+    if (await day.isVisible().catch(() => false)) {
+      await day.click();
+      await page.waitForTimeout(1_500);
+      return;
+    }
+    const next = dialog.getByRole("button", { name: /siguiente|pr[oó]ximo|next/i }).last();
+    if (!(await next.count()) || !(await next.isVisible().catch(() => false))) break;
+    await next.click();
+    await page.waitForTimeout(150);
+    await captureRunScreen(page, screenshots, `navegacion-calendario-${date}-mes-${month + 2}`);
+  }
+  throw new Error(`El calendario no mostró la fecha de ida ${date}.`);
 }
 
 async function setAirport(page: Page, label: RegExp, code: string) {
   await chooseAirport(page, label, code);
 }
 
-async function prepareForm(page: Page, followUp: FollowUp) {
+async function prepareForm(page: Page, followUp: FollowUp, destination = followUp.destinationIata) {
   await chooseTripType(page, followUp.tripType);
   await setAirport(page, /¿Desde dónde\?/i, followUp.originIata);
-  await setAirport(page, /¿A dónde quieres ir\?/i, followUp.destinationIata);
+  await setAirport(page, /¿A dónde quieres ir\?/i, destination);
   await chooseAdults(page, followUp.adults);
 }
 
+async function waitForFlightCard(page: Page, cards: ReturnType<Page["locator"]>) {
+  let deadline = Date.now() + 45_000;
+  let reloads = 0;
+  while (Date.now() < deadline) {
+    if (await cards.count() && await cards.first().isVisible().catch(() => false)) return;
+    const text = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
+    if (/no se encontraron resultados.{0,80}se produjo un error|there was an error.{0,80}results/i.test(text)) {
+      // Flights renders this action as a button in some layouts and as plain
+      // accessible text in others. Try both before classifying the attempt.
+      const reloadButton = page.getByRole("button", { name: /volver a cargar|reload/i }).last();
+      const reloadText = page.getByText(/volver a cargar|reload/i).last();
+      const reload = await reloadButton.count() && await reloadButton.isVisible().catch(() => false)
+        ? reloadButton
+        : reloadText;
+      if (reloads < 2 && await reload.count() && await reload.isVisible().catch(() => false)) {
+        reloads++;
+        await reload.click().catch(() => undefined);
+        await page.waitForTimeout(4_000);
+        deadline = Date.now() + 45_000;
+        continue;
+      }
+      throw new Error(`Transient Google Flights results error after ${reloads} page reload(s).`);
+    }
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error("Timed out waiting for Google Flights result cards.");
+}
+
 async function resultCards(page: Page) {
-  const cards = page.locator('[role="link"][aria-label*="Seleccionar vuelo"]');
-  await cards.first().waitFor({ state: "visible", timeout: 18_000 });
+  // Google changes the localized accessible name between layouts/releases.
+  // Match the stable flight-card role plus flight wording rather than one
+  // exact "Seleccionar vuelo" phrase.
+  const cards = page.locator('[role="link"][aria-label*="vuelo" i]:visible, [role="link"][aria-label*="flight" i]:visible');
+  try {
+    await waitForFlightCard(page, cards);
+  } catch {
+    const currentUrl = page.url().split("?")[0];
+    const bodyText = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
+    const pageText = bodyText.match(/(?:no se encontraron resultados.{0,100}|se produjo un error.{0,100}|there was an error.{0,100})/i)?.[0] ?? bodyText.slice(0, 120);
+    throw new Error(`Google Flights no mostró tarjetas de vuelos tras esperar 45 segundos. URL: ${currentUrl}. Página: ${pageText || "sin texto visible"}`);
+  }
   return cards;
 }
 
@@ -141,30 +344,34 @@ async function readCards(cards: Awaited<ReturnType<typeof resultCards>>) {
     let current: Element | null = node;
     let text = "";
     let logoUrl: string | null = null;
+    let logoAirlineName: string | null = null;
     for (let depth = 0; current && depth < 6; depth++, current = current.parentElement) {
-      const candidate = current.textContent ?? "";
+      const candidate = (current as HTMLElement).innerText ?? current.textContent ?? "";
       if (/\d{1,2}:\d{2}/.test(candidate) && /COP|pesos colombianos|\$/.test(candidate)) {
         text = candidate;
         const images = [...current.querySelectorAll("img")];
         const label = (node.getAttribute("aria-label") ?? "").toLocaleLowerCase();
-        const hasSecureSource = (image: HTMLImageElement) => /^https:\/\//i.test(image.currentSrc || image.src);
-        const logo = images.find((image) => hasSecureSource(image) && Boolean(image.alt?.trim()) && (label.includes(image.alt.toLocaleLowerCase()) || candidate.toLocaleLowerCase().includes(image.alt.toLocaleLowerCase())))
-          ?? images.find((image) => hasSecureSource(image) && Boolean(image.alt?.trim()))
-          ?? images.find(hasSecureSource);
+        // Keep predicates inline: Playwright serializes this callback into the
+        // page, where TypeScript transpiler helpers such as __name do not exist.
+        const logo = images.find((image) => /^https:\/\//i.test(image.currentSrc || image.src) && Boolean(image.alt?.trim()) && (label.includes(image.alt.toLocaleLowerCase()) || candidate.toLocaleLowerCase().includes(image.alt.toLocaleLowerCase())))
+          ?? images.find((image) => /^https:\/\//i.test(image.currentSrc || image.src) && Boolean(image.alt?.trim()))
+          ?? images.find((image) => /^https:\/\//i.test(image.currentSrc || image.src));
         logoUrl = logo ? (logo.currentSrc || logo.src) : null;
+        logoAirlineName = logo?.alt?.trim() || null;
         break;
       }
     }
-    return { label: node.getAttribute("aria-label") ?? "", text, logoUrl };
+    return { label: node.getAttribute("aria-label") ?? "", text, logoUrl, logoAirlineName };
   }));
 }
 
-async function getOneWayOptions(page: Page, threshold: number): Promise<FlightItineraryOption[]> {
+async function getOneWayOptions(page: Page, threshold: number, screenshots?: RunScreenshotContext | null): Promise<FlightItineraryOption[]> {
   const cards = await resultCards(page);
+  await captureRunScreen(page, screenshots, "resultados-vuelos-solo-ida");
   const raw = await readCards(cards);
   const found: FlightItineraryOption[] = [];
   raw.forEach((item) => {
-    const card = parseGoogleFlightCard(item.label, item.text, item.logoUrl);
+    const card = parseGoogleFlightCard(item.label, item.text, item.logoUrl, item.logoAirlineName);
     if (!card || card.amount > threshold) return;
     found.push({ outboundAirline: card.airline, outboundLogoUrl: card.logoUrl, outboundOperatedBy: card.operatedBy,
       inboundAirline: null, inboundLogoUrl: null, inboundOperatedBy: null, outboundDepartureTime: card.departureTime,
@@ -175,44 +382,56 @@ async function getOneWayOptions(page: Page, threshold: number): Promise<FlightIt
   return found;
 }
 
-async function getRoundTripOptions(page: Page, threshold: number): Promise<FlightItineraryOption[]> {
+export type EscapeCriteria = { outboundDate: string; inboundDate: string; outboundWindow: "friday_evening" | "saturday_morning"; inboundWindow: "sunday_evening" | "monday_holiday_evening"; originTimeZone: string; minimumNoticeHours: number };
+
+export function passesEscapeSchedule(option: FlightItineraryOption, criteria: EscapeCriteria, now = Date.now()) {
+  const outboundWindow = criteria.outboundWindow === "friday_evening" ? [19 * 60, 22 * 60] : [6 * 60, 10 * 60];
+  const returnWindow = [16 * 60, 20 * 60];
+  if (!isTimeInWindow(option.outboundDepartureTime, outboundWindow[0], outboundWindow[1])) return false;
+  if (!option.inboundDepartureTime || !isTimeInWindow(option.inboundDepartureTime, returnWindow[0], returnWindow[1])) return false;
+  return hasMinimumNotice(criteria.outboundDate, option.outboundDepartureTime, criteria.originTimeZone, criteria.minimumNoticeHours, now);
+}
+
+async function getRoundTripOptions(page: Page, threshold: number, escapeCriteria?: EscapeCriteria, screenshots?: RunScreenshotContext | null): Promise<FlightItineraryOption[]> {
   const outboundCards = await resultCards(page);
+  await captureRunScreen(page, screenshots, "resultados-vuelos-ida");
   const outboundRaw = await readCards(outboundCards);
   const collected: FlightItineraryOption[] = [];
   for (let index = 0; index < outboundRaw.length; index++) {
-    const outbound = parseGoogleFlightCard(outboundRaw[index].label, outboundRaw[index].text, outboundRaw[index].logoUrl);
+    const outbound = parseGoogleFlightCard(outboundRaw[index].label, outboundRaw[index].text, outboundRaw[index].logoUrl, outboundRaw[index].logoAirlineName);
     // Google displays the cheapest round-trip total associated with this outbound.
     // If that lower bound is above the alert threshold, no return can qualify.
     if (!outbound || outbound.amount > threshold) continue;
-    const departure = outbound.departureTime;
-    const [clock, meridiem] = departure.split(/\s+/);
-    const flexibleMeridiem = meridiem?.replaceAll(".", "\\.").replace(/\s+/g, "\\s*") ?? "";
-    const matching = outboundCards.nth(index).getByText(new RegExp(`${clock}\\s*${flexibleMeridiem}`, "i")).first();
-    await matching.click({ timeout: 8_000 });
-    await page.waitForTimeout(900);
+    // The accessible card contains the selectable flight link, while its time
+    // label varies between Google Flights layouts and is not reliably clickable.
+    await outboundCards.nth(index).click({ timeout: 15_000, force: true });
     let returnCards;
     try {
       returnCards = await resultCards(page);
+      await captureRunScreen(page, screenshots, `regresos-para-salida-${index + 1}`);
     } catch {
-      const change = page.getByRole("button", { name: /cambiar el vuelo de ida/i });
-      if (await change.count()) await change.click();
-      continue;
+      throw new Error("Google Flights cargó la salida pero no mostró la lista de vuelos de regreso.");
     }
     const returnRaw = await readCards(returnCards);
     for (const item of returnRaw) {
-      const inbound = parseGoogleFlightCard(item.label, item.text, item.logoUrl);
+      const inbound = parseGoogleFlightCard(item.label, item.text, item.logoUrl, item.logoAirlineName);
       if (!inbound || inbound.amount > threshold) continue;
-      collected.push({ outboundAirline: outbound.airline, outboundLogoUrl: outbound.logoUrl, outboundOperatedBy: outbound.operatedBy,
+      const option: FlightItineraryOption = { outboundAirline: outbound.airline, outboundLogoUrl: outbound.logoUrl, outboundOperatedBy: outbound.operatedBy,
         inboundAirline: inbound.airline, inboundLogoUrl: inbound.logoUrl, inboundOperatedBy: inbound.operatedBy,
         outboundDepartureTime: outbound.departureTime, outboundArrivalTime: outbound.arrivalTime,
         inboundDepartureTime: inbound.departureTime, inboundArrivalTime: inbound.arrivalTime,
         amount: inbound.amount, currency: inbound.currency, outboundStops: outbound.stops,
-        inboundStops: inbound.stops, separateTickets: outbound.separateTickets || inbound.separateTickets });
+        inboundStops: inbound.stops, separateTickets: outbound.separateTickets || inbound.separateTickets };
+      if (!escapeCriteria || passesEscapeSchedule(option, escapeCriteria)) collected.push(option);
     }
-    const change = page.getByRole("button", { name: /cambiar el vuelo de ida/i });
+    // In the return-selection view, Google labels the route control simply
+    // "CTG–BOG Cambiar" rather than "Cambiar el vuelo de ida".
+    const change = page.getByText("Cambiar", { exact: true }).last();
     if (await change.count()) {
       await change.click();
-      await page.waitForTimeout(500);
+      // Wait until Google has restored the outbound list before clicking the
+      // next departure; fixed short sleeps race with slower result rendering.
+      await resultCards(page);
     } else break;
   }
   const unique = new Map<string, FlightItineraryOption>();
@@ -220,80 +439,258 @@ async function getRoundTripOptions(page: Page, threshold: number): Promise<Fligh
   return [...unique.values()];
 }
 
-async function fetchFlightOptions(page: Page, followUp: FollowUp, result: FlightPriceResult) {
+async function fetchFlightOptionsAttempt(page: Page, followUp: FollowUp, result: FlightPriceResult, destination: string, escapeCriteria?: EscapeCriteria, screenshots?: RunScreenshotContext | null) {
   try {
     // Start from the same clean search form for each qualifying calendar fare.
     // Google replaces the date inputs with compact date controls after results load.
     await page.goto(FLIGHTS_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
     await page.getByRole("combobox", { name: /¿Desde dónde\?/i }).waitFor({ state: "visible", timeout: 20_000 });
-    await prepareForm(page, followUp);
+    await captureRunScreen(page, screenshots, `inicio-detalle-${destination}-${result.outboundDate}`);
+    await prepareForm(page, followUp, destination);
+    await captureRunScreen(page, screenshots, `formulario-detalle-${destination}-${result.outboundDate}`);
     await openCalendar(page, "Salida");
-    await selectCalendarDate(page, result.outboundDate);
-    if (followUp.tripType === "round_trip" && result.inboundDate) await selectCalendarDate(page, result.inboundDate);
+    await captureRunScreen(page, screenshots, `calendario-detalle-${destination}-${result.outboundDate}`);
+    await selectCalendarDate(page, result.outboundDate, screenshots);
+    if (followUp.tripType === "round_trip" && result.inboundDate) await selectCalendarDate(page, result.inboundDate, screenshots);
     await closeCalendar(page);
-    const search = page.getByRole("button", { name: /^buscar$/i });
+    // The page also has many suggested-destination cards whose accessible
+    // names begin with "Buscar vuelos". Target the actual form submit button.
+    const search = page.locator('button[aria-label="Buscar"]').last();
     await search.waitFor({ state: "visible", timeout: 10_000 });
     await search.click();
-    await page.waitForTimeout(1_500);
+    await captureRunScreen(page, screenshots, `resultados-detalle-${destination}-${result.outboundDate}`);
     const options = followUp.tripType === "one_way"
-      ? await getOneWayOptions(page, followUp.maxPriceCop)
-      : await getRoundTripOptions(page, followUp.maxPriceCop);
+      ? await getOneWayOptions(page, followUp.maxPriceCop, screenshots)
+      : await getRoundTripOptions(page, followUp.maxPriceCop, escapeCriteria, screenshots);
+    if (escapeCriteria && !options.length) return { ...result, meetsThreshold: false, details: [result.details, "El calendario dio un precio bajo el límite, pero no se encontraron vuelos que cumplan los horarios y la anticipación configurados."].filter(Boolean).join(" "), flightOptions: [], flightDetailsStatus: "no_matching_flights" as const };
     return { ...result, flightOptions: options, flightDetailsStatus: options.length ? "available" as const : "unavailable" as const };
   } catch (error) {
-    const reason = error instanceof Error ? error.message.slice(0, 240) : "Error no identificado";
+    await captureRunScreen(page, screenshots, `error-detalle-${destination}-${result.outboundDate}`);
+    const reason = error instanceof Error ? error.message.slice(0, 900) : "Error no identificado";
     return { ...result, details: [result.details, `No se pudo obtener el detalle de vuelos: ${reason}`].filter(Boolean).join(" "), flightOptions: [], flightDetailsStatus: "unavailable" as const };
   }
 }
 
-export async function scanGoogleFlights(followUp: FollowUp): Promise<FlightPriceResult[]> {
+async function fetchFlightOptions(page: Page, followUp: FollowUp, result: FlightPriceResult, destination = followUp.destinationIata, escapeCriteria?: EscapeCriteria, screenshots?: RunScreenshotContext | null) {
+  let detailed = await fetchFlightOptionsAttempt(page, followUp, result, destination, escapeCriteria, screenshots);
+  const transientResultFailure = /transient google flights results error|no se encontraron resultados.{0,100}se produjo un error|there was an error.{0,100}results/i;
+  if (detailed.flightDetailsStatus === "unavailable" && transientResultFailure.test(detailed.details ?? "")) {
+    await page.waitForTimeout(2_000);
+    detailed = await fetchFlightOptionsAttempt(page, followUp, result, destination, escapeCriteria, screenshots);
+  }
+  return detailed;
+}
+
+function bogotaToday() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Bogota", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+}
+
+async function scanWeekendEscape(page: Page, followUp: FollowUp, screenshots?: RunScreenshotContext | null, onProgress?: SearchProgressCallback): Promise<FlightPriceResult[]> {
+  const destinations = [...new Set(followUp.destinationIatas?.length ? followUp.destinationIatas : [followUp.destinationIata])];
+  const lookaheadDays = followUp.lookaheadDays ?? 120;
+  const originTimeZone = airportTimeZone(followUp.originIata);
+  const candidates = weekendEscapeCandidates(destinations, bogotaToday(), lookaheadDays, MAX_WEEKEND_ESCAPE_COMBINATIONS);
+  if (!candidates.length) return [];
+  const results: FlightPriceResult[] = [];
+  const pendingDetails: Array<{ result: FlightPriceResult; destination: string; criteria: EscapeCriteria }> = [];
+  let checkedCandidates = 0;
+  const destinationTotals = new Map(destinations.map((destination) => [destination, candidates.filter((candidate) => candidate.destinationIata === destination).length]));
+  const destinationCompleted = new Map(destinations.map((destination) => [destination, 0]));
+  const destinationProgress = () => destinations.map((destinationIata) => ({
+    destinationIata,
+    completed: destinationCompleted.get(destinationIata) ?? 0,
+    total: destinationTotals.get(destinationIata) ?? 0,
+  }));
+  const emitProgress = (phase: string, current?: string, completed = checkedCandidates, total = candidates.length) => onProgress?.({
+    phase,
+    completed,
+    total,
+    ...(current ? { current } : {}),
+    destinationProgress: destinationProgress(),
+  });
+  emitProgress("Seleccionando fechas de ida");
+
+  for (const destination of destinations) {
+    const destinationCandidates = candidates.filter((candidate) => candidate.destinationIata === destination);
+    const outboundDates = [...new Set(destinationCandidates.map((candidate) => candidate.outboundDate))];
+    if (!outboundDates.length) continue;
+    await page.goto(FLIGHTS_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    await page.getByRole("combobox", { name: /¿Desde dónde\?/i }).waitFor({ state: "visible", timeout: 20_000 });
+    await captureRunScreen(page, screenshots, `inicio-${destination}`);
+    await prepareForm(page, followUp, destination);
+    await captureRunScreen(page, screenshots, `formulario-${destination}`);
+    const destinationResults: FlightPriceResult[] = [];
+    for (const outboundDate of outboundDates) {
+      const matchingCandidates = destinationCandidates.filter((candidate) => candidate.outboundDate === outboundDate);
+      const inboundDates = [...new Set(matchingCandidates.map((candidate) => candidate.inboundDate))];
+      emitProgress("Seleccionando fechas de ida", `${destination} · ${outboundDate}`);
+      await openCalendar(page, "Salida");
+      await captureRunScreen(page, screenshots, `calendario-salida-${destination}-${outboundDate}`);
+      await selectCalendarDate(page, outboundDate, screenshots);
+      await captureRunScreen(page, screenshots, `calendario-ida-seleccionada-${destination}-${outboundDate}`);
+      const returnPrices = new Map((await parseCalendarPrices(page, inboundDates, "Regreso", undefined, 12, screenshots)).map((fare) => [fare.outboundDate, fare]));
+      await captureRunScreen(page, screenshots, `calendario-regresos-con-precios-${destination}-${outboundDate}`);
+      await closeCalendar(page);
+      for (const candidate of matchingCandidates) {
+        const fare = returnPrices.get(candidate.inboundDate);
+        if (!fare) continue;
+        const nights = daysBetween(candidate.outboundDate, candidate.inboundDate) ?? 0;
+        destinationResults.push({
+          ...fare, outboundDate: candidate.outboundDate, inboundDate: candidate.inboundDate,
+          destinationIata: destination,
+          meetsThreshold: fare.amount !== null && fare.currency === "COP" && fare.amount <= followUp.maxPriceCop,
+          details: fare.currency === "COP" ? `Escape de fin de semana (${nights} ${nights === 1 ? "noche" : "noches"}); precio total del calendario.` : "Se conserva la moneda sin conversión a COP.",
+        });
+      }
+      checkedCandidates += matchingCandidates.length;
+      destinationCompleted.set(destination, (destinationCompleted.get(destination) ?? 0) + matchingCandidates.length);
+      emitProgress("Validando combinaciones", `${destination} · ${outboundDate}`);
+    }
+
+    for (const result of destinationResults) {
+      if (result.meetsThreshold && result.amount !== null) {
+        const candidate = destinationCandidates.find((item) => item.outboundDate === result.outboundDate && item.inboundDate === result.inboundDate)!;
+        const criteria: EscapeCriteria = {
+          outboundDate: candidate.outboundDate, inboundDate: candidate.inboundDate,
+          outboundWindow: candidate.outboundWindow, inboundWindow: candidate.inboundWindow,
+          originTimeZone, minimumNoticeHours: followUp.minNoticeHours ?? 8,
+        };
+        pendingDetails.push({ result, destination, criteria });
+      } else results.push(result);
+    }
+  }
+  emitProgress("Buscando horarios", undefined, 0, pendingDetails.length);
+  for (let index = 0; index < pendingDetails.length; index++) {
+    const item = pendingDetails[index];
+    results.push(await fetchFlightOptions(page, { ...followUp, destinationIata: item.destination }, item.result, item.destination, item.criteria, screenshots));
+    emitProgress("Buscando horarios", `${item.destination} · ${item.result.outboundDate}`, index + 1, pendingDetails.length);
+  }
+  return results;
+}
+
+export async function scanGoogleFlights(followUp: FollowUp, runId?: string, onProgress?: SearchProgressCallback): Promise<FlightPriceResult[]> {
   let browser: Browser | null = null;
+  const plannedTotal = followUp.mode === "weekend_escape"
+    ? weekendEscapeCandidates(followUp.destinationIatas?.length ? followUp.destinationIatas : [followUp.destinationIata], bogotaToday(), followUp.lookaheadDays ?? 120, MAX_WEEKEND_ESCAPE_COMBINATIONS).length
+    : followUp.tripType === "one_way"
+      ? dateRange(followUp.outboundMode, followUp.outboundStart, followUp.outboundEnd).length
+      : validRoundTripPairs(followUp).length;
+  onProgress?.({ phase: "Abriendo Google Flights", completed: 0, total: plannedTotal });
+  const screenshotContext: RunScreenshotContext | null = runId ? {
+    directory: path.join(process.cwd(), "prints de pantallas", `${new Date().toISOString().replace(/[:.]/g, "-")}_${safeScreenshotName(followUp.name)}_${runId}`),
+    sequence: 0,
+    manifest: [],
+  } : null;
   try {
-    browser = await chromium.launch({ headless: true });
+    if (screenshotContext) {
+      await mkdir(screenshotContext.directory, { recursive: true });
+      await writeFile(path.join(screenshotContext.directory, "ejecucion.json"), JSON.stringify({
+        runId,
+        followUpId: followUp.id,
+        followUpName: followUp.name,
+        originIata: followUp.originIata,
+        destinations: followUp.destinationIatas?.length ? followUp.destinationIatas : [followUp.destinationIata],
+        mode: followUp.mode ?? "standard",
+        tripType: followUp.tripType,
+        startedAt: new Date().toISOString(),
+        note: "Las capturas corresponden a pantallas visibles de Google Flights durante esta ejecución.",
+      }, null, 2), "utf8");
+    }
+    // Use the installed stable Chrome channel. On some Windows machines the
+    // Playwright-downloaded headless-shell binary is blocked with spawn EPERM,
+    // while the user's installed Chrome is allowed to launch headlessly.
+    browser = await chromium.launch({ headless: true, channel: "chrome" });
+    if (runId) {
+      flightBrowsers.set(runId, browser);
+      if (stoppedRunIds.has(runId)) await browser.close();
+    }
     const context = await browser.newContext({ locale: "es-CO", timezoneId: "America/Bogota", viewport: { width: 1440, height: 1050 } });
     const page = await context.newPage();
     page.setDefaultTimeout(12_000);
     await page.goto(FLIGHTS_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
     await page.getByRole("combobox", { name: /¿Desde dónde\?/i }).waitFor({ state: "visible", timeout: 20_000 });
+    await captureRunScreen(page, screenshotContext, "inicio-google-flights");
+    if (followUp.mode === "weekend_escape") return await scanWeekendEscape(page, followUp, screenshotContext, onProgress);
     await prepareForm(page, followUp);
+    await captureRunScreen(page, screenshotContext, "formulario-configurado");
     const results: FlightPriceResult[] = [];
     if (followUp.tripType === "one_way") {
       const dates = dateRange(followUp.outboundMode, followUp.outboundStart, followUp.outboundEnd);
-      for (const date of dates.length ? dates : [followUp.outboundStart]) {
-        await closeCalendar(page);
-        await openCalendar(page, "Salida");
-        await selectCalendarDate(page, date);
-        results.push(...await parseCalendarPrices(page, [date], "Salida"));
+      const candidateDates = dates.length ? dates : [followUp.outboundStart];
+      const faresByDate = new Map<string, FlightPriceResult>();
+      onProgress?.({ phase: "Seleccionando fechas de ida", completed: 0, total: candidateDates.length });
+      for (let index = 0; index < candidateDates.length; index++) {
+        const date = candidateDates[index];
+        onProgress?.({ phase: "Seleccionando fecha de ida", completed: index, total: candidateDates.length, current: date });
+        let fares: FlightPriceResult[] = [];
+        for (let attempt = 1; attempt <= 3 && !fares.some((item) => item.outboundDate === date); attempt++) {
+          const phase = attempt === 1 ? "Leyendo precio tras seleccionar la ida" : `Reintentando selección y lectura ${attempt}/3`;
+          await openCalendar(page, "Salida");
+          await captureRunScreen(page, screenshotContext, `calendario-${date}-intento-${attempt}-antes-del-clic`);
+          // A repeated click forces Google to refresh the selected-date fare
+          // instead of rereading a stale day cell. Wait for the target fare in
+          // this same calendar session before confirming/closing it.
+          await selectCalendarDate(page, date, screenshotContext);
+          await captureRunScreen(page, screenshotContext, `calendario-${date}-intento-${attempt}-despues-del-clic`);
+          fares = await parseCalendarPrices(page, [date], "Salida", (summary) => onProgress?.({ phase, completed: index, total: candidateDates.length, current: summary }), 12, screenshotContext);
+          await captureRunScreen(page, screenshotContext, `calendario-${date}-intento-${attempt}-lectura`);
+          await closeCalendar(page);
+          if (!fares.some((item) => item.outboundDate === date) && attempt < 3) {
+            onProgress?.({ phase: "Esperando actualización del precio", completed: index, total: candidateDates.length, current: `${date} · intento ${attempt}/3` });
+            await page.waitForTimeout(1_000);
+          }
+        }
+        const fare = fares.find((item) => item.outboundDate === date);
+        if (fare) faresByDate.set(date, { ...fare, inboundDate: null });
+        onProgress?.({ phase: "Fechas de ida revisadas", completed: index + 1, total: candidateDates.length, current: `${date}${fare ? ` · ${fare.amount ?? "sin precio"} ${fare.currency}` : " · sin precio legible"}` });
       }
-      await closeCalendar(page);
+      results.push(...candidateDates.flatMap((date) => faresByDate.has(date) ? [faresByDate.get(date)!] : []));
     } else {
       const pairs = validRoundTripPairs(followUp);
+      let checkedPairs = 0;
+      onProgress?.({ phase: "Seleccionando fechas de ida", completed: 0, total: pairs.length });
       if (pairs.length > MAX_COMBINATIONS) throw new Error(`El seguimiento genera ${pairs.length} combinaciones; el máximo inicial es ${MAX_COMBINATIONS}. Reduce los rangos o fija la estadía.`);
       if (!pairs.length) throw new Error("Los rangos no contienen una combinación válida de ida y vuelta con al menos una noche.");
-      for (const pair of pairs) {
-        await closeCalendar(page);
+      const outboundDates = [...new Set(pairs.map((pair) => pair.outboundDate))];
+      for (const outboundDate of outboundDates) {
+        const matchingPairs = pairs.filter((pair) => pair.outboundDate === outboundDate);
+        const inboundDates = [...new Set(matchingPairs.map((pair) => pair.inboundDate))];
+        onProgress?.({ phase: "Seleccionando fecha de ida", completed: checkedPairs, total: pairs.length, current: outboundDate });
         await openCalendar(page, "Salida");
-        await selectCalendarDate(page, pair.outboundDate);
-        await selectCalendarDate(page, pair.inboundDate);
-        const price = (await parseCalendarPrices(page, [pair.inboundDate], "Regreso"))[0];
-        if (price) {
-          const nights = Number((new Date(`${pair.inboundDate}T00:00:00Z`).valueOf() - new Date(`${pair.outboundDate}T00:00:00Z`).valueOf()) / 86_400_000);
-          results.push({ ...price, outboundDate: pair.outboundDate, inboundDate: pair.inboundDate, details: price.currency === "COP" ? `Precio total indicado en el calendario para una estadía de ${nights} ${nights === 1 ? "noche" : "noches"}.` : "Se conserva la moneda sin conversión a COP." });
+        await captureRunScreen(page, screenshotContext, `calendario-salida-${outboundDate}`);
+        await selectCalendarDate(page, outboundDate, screenshotContext);
+        await captureRunScreen(page, screenshotContext, `calendario-ida-seleccionada-${outboundDate}`);
+        const returnPrices = new Map((await parseCalendarPrices(page, inboundDates, "Regreso", undefined, 12, screenshotContext)).map((fare) => [fare.outboundDate, fare]));
+        await captureRunScreen(page, screenshotContext, `calendario-regresos-con-precios-${outboundDate}`);
+        await closeCalendar(page);
+        for (const inboundDate of inboundDates) {
+          const price = returnPrices.get(inboundDate);
+          if (!price) continue;
+          const nights = daysBetween(outboundDate, inboundDate) ?? 0;
+          results.push({ ...price, outboundDate, inboundDate, details: price.currency === "COP" ? `Precio total indicado en el calendario para una estadía de ${nights} ${nights === 1 ? "noche" : "noches"}.` : "Se conserva la moneda sin conversión a COP." });
         }
+        checkedPairs += matchingPairs.length;
+        onProgress?.({ phase: "Validando precios totales", completed: checkedPairs, total: pairs.length, current: outboundDate });
       }
-      await closeCalendar(page);
     }
-    const thresholdResults = results.map((result) => ({ ...result, meetsThreshold: result.amount !== null && result.amount <= followUp.maxPriceCop }));
+    const thresholdResults = results.map((result) => ({ ...result, destinationIata: result.destinationIata ?? followUp.destinationIata, meetsThreshold: !result.isCalendarMinimum && result.amount !== null && result.amount <= followUp.maxPriceCop }));
     const qualifying = thresholdResults.filter((result) => result.meetsThreshold && result.amount !== null && result.currency === "COP");
-    for (const result of qualifying) {
-      const detailed = await fetchFlightOptions(page, followUp, result);
-      const index = thresholdResults.indexOf(result);
-      thresholdResults[index] = detailed;
+    onProgress?.({ phase: "Buscando horarios", completed: 0, total: qualifying.length });
+    for (let index = 0; index < qualifying.length; index++) {
+      const result = qualifying[index];
+      const detailed = await fetchFlightOptions(page, followUp, result, followUp.destinationIata, undefined, screenshotContext);
+      const resultIndex = thresholdResults.indexOf(result);
+      thresholdResults[resultIndex] = { ...detailed, destinationIata: detailed.destinationIata ?? followUp.destinationIata };
+      onProgress?.({ phase: "Buscando horarios", completed: index + 1, total: qualifying.length, current: `${result.outboundDate}${result.inboundDate ? ` → ${result.inboundDate}` : ""}` });
     }
+    onProgress?.({ phase: "Búsqueda terminada", completed: plannedTotal, total: plannedTotal });
     return thresholdResults;
   } catch (error) {
     if (error instanceof Error) throw error;
     throw new Error("Fallo desconocido al consultar Google Flights.");
   } finally {
+    if (runId) flightBrowsers.delete(runId);
+    if (runId) stoppedRunIds.delete(runId);
     await browser?.close().catch(() => undefined);
   }
 }

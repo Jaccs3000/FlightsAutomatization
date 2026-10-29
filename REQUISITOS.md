@@ -73,6 +73,9 @@ No se guardarán nombres, fechas de nacimiento ni otra información personal de 
 - Un seguimiento pausado no se consulta.
 - Si el proceso estaba apagado al llegar un horario, se omite esa ejecución y se espera a la siguiente. No se ejecuta una recuperación atrasada.
 - Si una consulta falla, se registra el error y se vuelve a intentar en la siguiente hora programada. No habrá reintentos automáticos dentro de la misma ejecución.
+- La duracion de estadia solo se muestra cuando al menos un tramo usa rango flexible.
+- Historial incluye una accion para borrar todas las ejecuciones y sus resultados/notificaciones, sin afectar seguimientos ni ajustes.
+- La clave maestra de la boveda se puede enviar con Enter mientras esta bloqueada.
 - Si una hora concreta no muestra precio, se ignora esa fecha; no se considera un error de consulta.
 - Se esperan unos cuatro seguimientos al inicio, con posibilidad de agregar más.
 - No se permiten dos lotes de ejecución simultáneos. Recomendación adoptada: si un lote sigue activo cuando llega el siguiente horario, omitir ese lote programado y registrarlo como omitido por solapamiento.
@@ -134,6 +137,8 @@ Entidades lógicas sugeridas: `FollowUp`, `AppSettings`, `Run`, `RunResult` y `E
 1. **Panel:** próximos horarios, resumen de seguimientos activos/pausados, actividad reciente y acción “Ejecutar todos ahora”.
 2. **Seguimientos:** listado, estado y acciones para crear, editar, pausar, activar, eliminar o ejecutar uno ahora.
 3. **Formulario:** nombre, aeropuertos IATA, tipo de viaje, fechas por tramo, duración, cantidad de adultos y límite COP.
+   - Los campos de aeropuerto ofrecen coincidencias globales por nombre, ciudad o código IATA, mostrando código, aeropuerto, ciudad y país. La búsqueda usa un catálogo local derivado de OurAirports.
+   - Escape fin de semana permite añadir de tres a cuatro destinos en campos separados. El precio se presenta en COP sin decimales y con separadores de miles.
 4. **Historial:** ejecuciones, precios, moneda, correos y errores; filtros por seguimiento y fecha.
 5. **Configuración:** horas diarias, destinatario común, configuración de EmailJS y días de retención.
 
@@ -196,3 +201,17 @@ El máximo de 50 combinaciones queda fijado para la primera versión. Los seguim
 3. **Precio que no esté en COP:** se interpreta la respuesta del usuario como guardar en el historial el importe, moneda y observación; al no poder compararlo con un límite en COP, no convertirlo ni enviar alerta.
 4. **Windows y bloqueo:** el usuario inicia la app manualmente y deja el proceso abierto. No se crean tareas, servicios, variables de entorno ni cambios en el Registro. Debe seguir funcionando con la pantalla bloqueada si el equipo permanece despierto; no se ejecuta durante suspensión o hibernación.
 5. **Interfaz abierta:** “la app debe quedar abierta” se interpreta como mantener activo el proceso de la aplicación y su scheduler. La pestaña del navegador puede permanecer abierta como panel, pero no es necesaria para que corran las consultas.
+
+## 17. Seguimiento "Escape fin de semana"
+
+Este modo nuevo coexiste con los seguimientos de fechas configuradas y no cambia su comportamiento.
+
+- Un origen y entre tres y cuatro destinos IATA por seguimiento; mínimo un adulto y un precio máximo total común en COP.
+- Horizonte configurable, inicial de 120 días desde la fecha actual de Bogotá. El regreso del lunes puede quedar fuera del límite si la salida está dentro del horizonte.
+- Salida viernes de 7:00 p. m. a 10:00 p. m. o sábado de 6:00 a. m. a 10:00 a. m.; regreso domingo de 4:00 p. m. a 8:00 p. m. y también lunes en ese horario cuando sea festivo nacional no laborable. Los límites horarios son inclusivos.
+- Festivos calculados con la legislación colombiana vigente y sus reglas de traslado. El domingo por sí mismo no activa el regreso del lunes.
+- Anticipación mínima configurable, inicial de ocho horas. Se valida con la fecha y hora local del aeropuerto de origen; si su zona horaria no está identificada, la ejecución se registra como error para evitar comparar mal el plazo.
+- Hasta 200 combinaciones de destino, salida y regreso por ejecución.
+- Primero se leen los precios totales del calendario sin pulsar Buscar. Solo si el precio cumple el umbral se abre la página de resultados para verificar aerolíneas, horarios y parejas reales.
+- Un correo por ejecución con todos los resultados de todos los destinos que cumplan precio, horario y anticipación. Si Google no carga el detalle, se conserva el correo de respaldo con el precio del calendario y se indica que los horarios no pudieron verificarse.
+- El destino y el estado de verificación de horarios se conservan en el historial.

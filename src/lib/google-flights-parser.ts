@@ -21,10 +21,24 @@ function parseTimes(value: string) {
   return [...value.matchAll(pattern)].map((match) => `${match[1]} ${match[2].replace(/[\s.]/g, "").toLowerCase() === "am" ? "a. m." : "p. m."}`);
 }
 
-function parseAirline(accessibleLabel: string, lines: string[]) {
+const airlineNamesByCode: Record<string, string> = {
+  AV: "Avianca", JA: "JetSMART", LA: "LATAM", P5: "Wingo", CM: "Copa Airlines",
+  AA: "American Airlines", DL: "Delta Air Lines", UA: "United Airlines", IB: "Iberia",
+  UX: "Air Europa", AF: "Air France", KL: "KLM", LH: "Lufthansa", BA: "British Airways",
+};
+
+function parseAirline(accessibleLabel: string, lines: string[], logoUrl: string | null, logoAirlineName: string | null) {
   const label = normalizeText(accessibleLabel);
   const labelMatch = label.match(/Vuelo\s+(?:sin escalas|con\s+[^.]+?)\s+de\s+(.+?)(?:\.|\s+Sale de\b)/i);
-  const candidate = labelMatch?.[1] ?? lines.find((line) => /[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(line) && !/boletos separados|directo|escala|kg\s*co2|emisiones|ida y vuelta|cop\s*\d|duraci[oó]n|operado por/i.test(line));
+  const imageName = logoAirlineName?.replace(/\s+(?:logo|airline logo|airlines logo)$/i, "").trim();
+  const logoCode = logoUrl?.match(/\/([A-Za-z0-9]+)\.png(?:\?.*)?$/i)?.[1]?.toUpperCase();
+  const candidates = lines.map((line) => line
+    .replace(/^Boletos separados\s*[·•-]?\s*/i, "")
+    .split(/\s+[·•]\s+/)[0]
+    .replace(/\s+Operado por\s+.+$/i, "")
+    .trim());
+  const candidate = labelMatch?.[1] ?? imageName ?? airlineNamesByCode[logoCode ?? ""] ?? candidates.find((line) =>
+    /[A-Za-zÀ-ÿ]/.test(line) && !/boletos separados|directo|escala|kg\s*co2|emisiones|ida y vuelta|cop\s*\d|duraci[oó]n|operado por|\d{1,2}:\d{2}|\$|COP/i.test(line));
   if (!candidate) return { airline: "Aerolínea no identificada", operatedBy: null };
   const normalized = candidate.replace(/^Boletos separados\s*[·•-]?\s*/i, "").trim();
   const operator = normalized.match(/\s*Operado por\s+(.+)$/i);
@@ -32,7 +46,7 @@ function parseAirline(accessibleLabel: string, lines: string[]) {
   return { airline: airline || "Aerolínea no identificada", operatedBy: operator?.[1]?.replace(/[.\s]+$/, "") ?? null };
 }
 
-export function parseGoogleFlightCard(accessibleLabel: string, visibleText: string, logoUrl: string | null = null): ParsedGoogleFlightCard | null {
+export function parseGoogleFlightCard(accessibleLabel: string, visibleText: string, logoUrl: string | null = null, logoAirlineName: string | null = null): ParsedGoogleFlightCard | null {
   const normalizedLabel = normalizeText(accessibleLabel);
   const normalizedText = normalizeText(visibleText);
   const times = parseTimes(`${normalizedLabel}\n${normalizedText}`);
@@ -40,7 +54,7 @@ export function parseGoogleFlightCard(accessibleLabel: string, visibleText: stri
   if (!price || times.length < 2) return null;
 
   const lines = visibleText.replace(/\u00a0/g, " ").split(/\n+/).map(normalizeText).filter(Boolean);
-  const { airline, operatedBy } = parseAirline(normalizedLabel, lines);
+  const { airline, operatedBy } = parseAirline(normalizedLabel, lines, logoUrl, logoAirlineName);
   const stops = lines.find((line) => /^(?:Directo|\d+\s+escalas?)$/i.test(line)) ?? null;
 
   return {

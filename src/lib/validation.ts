@@ -12,6 +12,10 @@ export const followUpSchema = z.object({
   name: z.string().trim().min(1, "Escribe un nombre para el seguimiento.").max(80),
   originIata: iata,
   destinationIata: iata,
+  destinationIatas: z.array(iata).optional(),
+  mode: z.enum(["standard", "weekend_escape"]).optional(),
+  lookaheadDays: z.number().int().min(1).max(365).optional(),
+  minNoticeHours: z.number().int().min(1).max(168).optional(),
   tripType: z.enum(["one_way", "round_trip"]),
   outboundMode: z.enum(["exact", "flexible"]),
   outboundStart: isoDate,
@@ -24,8 +28,15 @@ export const followUpSchema = z.object({
   maxPriceCop: z.number().int().min(1).max(2_000_000_000),
   status: z.enum(["active", "paused"]),
 }).superRefine((value, context) => {
-  if (value.originIata === value.destinationIata) {
+  const destinations = value.mode === "weekend_escape" ? value.destinationIatas ?? [] : [value.destinationIata];
+  if (destinations.some((destination) => value.originIata === destination)) {
     context.addIssue({ code: "custom", path: ["destinationIata"], message: "El origen y el destino deben ser diferentes." });
+  }
+  if (value.mode === "weekend_escape") {
+    if (destinations.length < 1 || new Set(destinations).size !== destinations.length) {
+      context.addIssue({ code: "custom", path: ["destinationIatas"], message: "Escape fin de semana requiere al menos un destino y no permite destinos repetidos." });
+    }
+    return;
   }
   const today = bogotaToday();
   const maxDate = new Date(`${today}T12:00:00Z`);
@@ -58,6 +69,9 @@ export const followUpSchema = z.object({
       checkRange(value.inboundMode, value.inboundStart, value.inboundEnd, "inboundEnd");
       const outboundDates = dateRange(value.outboundMode, value.outboundStart, value.outboundEnd);
       const inboundDates = dateRange(value.inboundMode, value.inboundStart, value.inboundEnd);
+      if (inboundDates.some((arrival) => arrival < value.outboundStart)) {
+        context.addIssue({ code: "custom", path: ["inboundStart"], message: "El rango de regreso no puede comenzar antes de la fecha inicial de salida." });
+      }
       if (value.stayNights !== null && value.stayNights !== undefined) {
         const hasPair = outboundDates.some((departure) => inboundDates.some((arrival) => daysBetween(departure, arrival) === value.stayNights));
         if (!hasPair) context.addIssue({ code: "custom", path: ["stayNights"], message: "No hay fechas en esos rangos con esa duración." });

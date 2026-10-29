@@ -1,5 +1,6 @@
 import { getAppSecret, updateSenderEmail } from "./db";
 import { isVaultUnlocked, readVaultSecret, storeVaultSecret, deleteVaultSecret } from "./vault";
+import { assertEmailJsPayloadWithinLimit } from "./emailjs-size";
 
 const SECRET_KEY = "emailjs_config";
 const EMAILJS_SEND_URL = "https://api.emailjs.com/api/v1.0/email/send";
@@ -80,10 +81,12 @@ async function loadEmailJsConfig() {
 
 export async function sendEmailJsMessage(message: EmailJsMessage) {
   const config = await loadEmailJsConfig();
+  const payload = buildEmailJsPayload(config, message);
+  assertEmailJsPayloadWithinLimit(payload);
   const response = await fetch(EMAILJS_SEND_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(buildEmailJsPayload(config, message)),
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) {

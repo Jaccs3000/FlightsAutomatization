@@ -1,3 +1,5 @@
+param([switch]$BrowserAlreadyOpened)
+
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $url = "http://127.0.0.1:3030"
@@ -44,6 +46,9 @@ if (-not (Test-App)) {
   Write-LauncherLog "Vuela ya estaba ejecutandose."
 }
 
-# Open with the default browser; Windows opens a new tab when that browser is already running.
-Start-Process $url
-Write-LauncherLog "Se abrio $url en el navegador predeterminado."
+# The VBS launcher opens a waiting page immediately, which redirects this tab
+# after the backend is ready. The batch launcher still opens the app here.
+if (-not $BrowserAlreadyOpened) {
+  Start-Process $url
+  Write-LauncherLog "Se abrio $url en el navegador predeterminado."
+}

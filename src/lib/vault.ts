@@ -1,9 +1,14 @@
 import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCallback } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { getAppSecret, resetAppSecrets, setAppSecret } from "./db";
 
 const CHECK_VALUE = "vuela-vault-check-v1";
+const REMEMBERED_PASSPHRASE_KEY = "VUELA_VAULT_PASSPHRASE";
+const LOCAL_ENV_PATH = path.join(process.cwd(), ".env");
 // Share in-memory state between Next's server bundle and the scheduler entrypoint.
-// The key stays in this process and is never persisted unencrypted.
+// The derived encryption key stays in memory. The optional remembered master
+// passphrase is stored in the local, git-ignored .env file only when requested.
 const SESSION_KEY = Symbol.for("vuela.vault.session-key");
 function getSessionKey(): Buffer | null {
   return ((globalThis as Record<symbol, unknown>)[SESSION_KEY] as Buffer | undefined) ?? null;
@@ -26,6 +31,33 @@ function encode(data: Buffer) {
 
 function decode(data: string) {
   return Buffer.from(data, "base64url");
+}
+
+async function readRememberedPassphrase(): Promise<string | null> {
+  const content = await readFile(LOCAL_ENV_PATH, "utf8").catch(() => "");
+  const line = content.split(/\r?\n/).find((entry) => /^\s*(?:export\s+)?VUELA_VAULT_PASSPHRASE\s*=/.test(entry));
+  if (!line) return null;
+  const value = line.slice(line.indexOf("=") + 1).trim();
+  if (!value) return null;
+  if (value.startsWith('"')) {
+    try { return JSON.parse(value) as string; } catch { return null; }
+  }
+  return value.replace(/^(['"])(.*)\1$/, "$2");
+}
+
+export async function rememberVaultPassphrase(passphrase: string | null) {
+  const current = await readFile(LOCAL_ENV_PATH, "utf8").catch(() => "");
+  const lines = current.split(/\r?\n/).filter((line) => !/^\s*(?:export\s+)?VUELA_VAULT_PASSPHRASE\s*=/.test(line));
+  if (passphrase !== null) lines.push(`${REMEMBERED_PASSPHRASE_KEY}=${JSON.stringify(passphrase)}`);
+  const content = lines.filter((line, index) => line || index < lines.length - 1).join("\n").replace(/\n*$/, "\n");
+  await writeFile(LOCAL_ENV_PATH, content, { encoding: "utf8", mode: 0o600 });
+}
+
+export async function autoUnlockRememberedVault() {
+  const passphrase = await readRememberedPassphrase();
+  if (!passphrase || !(await getAppSecret("vault_meta"))) return { remembered: Boolean(passphrase), unlocked: false };
+  const unlocked = await unlockVault(passphrase);
+  return { remembered: true, unlocked };
 }
 
 async function deriveKey(passphrase: string, salt: Buffer) {
@@ -51,7 +83,7 @@ function decrypt(key: Buffer, value: { nonce: string; tag: string; ciphertext: s
 }
 
 export async function vaultStatus() {
-  return { configured: Boolean(await getAppSecret("vault_meta")), unlocked: getSessionKey() !== null };
+  return { configured: Boolean(await getAppSecret("vault_meta")), unlocked: getSessionKey() !== null, remembered: Boolean(await readRememberedPassphrase()) };
 }
 
 export async function setupVault(passphrase: string) {

@@ -4,6 +4,8 @@ import { meetsCopThreshold, parsePrice } from "./prices";
 describe("Google Flights calendar price parsing", () => {
   it("converts abbreviated COP calendar amounts", () => {
     expect(parsePrice("15 $245 k")).toEqual({ amount: 245000, currency: "COP" });
+    expect(parsePrice("$ 350 mil")).toEqual({ amount: 350000, currency: "COP" });
+    expect(parsePrice("350 mil COP")).toEqual({ amount: 350000, currency: "COP" });
   });
 
   it("keeps a dollar currency code when Google shows one", () => {

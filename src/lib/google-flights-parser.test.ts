@@ -19,4 +19,14 @@ describe("Google Flights result card parser", () => {
     expect(parsed?.separateTickets).toBe(true);
     expect(parsed?.airline).toBe("LATAM");
   });
+
+  it("uses the carrier logo label when Google changes the result wording", () => {
+    const parsed = parseGoogleFlightCard(
+      "Precio total ida y vuelta desde 376010 pesos colombianos. Vuelo de CTG a BOG. Sale de CTG a las 9:45 p.m. y llega a BOG a las 11:15 p.m.",
+      "9:45 p.m. – 11:15 p.m.\nDirecto\n376.010 COP ida y vuelta",
+      "https://www.gstatic.com/flights/airline_logos/70px/AV.png",
+      "Avianca",
+    );
+    expect(parsed).toMatchObject({ airline: "Avianca", logoUrl: "https://www.gstatic.com/flights/airline_logos/70px/AV.png" });
+  });
 });

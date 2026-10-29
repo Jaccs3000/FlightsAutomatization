@@ -1,13 +1,19 @@
 export type TripType = "one_way" | "round_trip";
 export type DateMode = "exact" | "flexible";
 export type FollowUpStatus = "active" | "paused";
-export type RunStatus = "running" | "completed" | "completed_with_matches" | "no_prices" | "failed" | "skipped_overlap";
+export type FollowUpMode = "standard" | "weekend_escape";
+export type RunStatus = "running" | "completed" | "completed_with_matches" | "no_prices" | "failed" | "cancelled" | "skipped_overlap";
 
 export interface FollowUp {
   id: string;
   name: string;
   originIata: string;
   destinationIata: string;
+  /** Multiple destinations are used only by weekend-escape follow-ups. */
+  destinationIatas?: string[];
+  mode?: FollowUpMode;
+  lookaheadDays?: number;
+  minNoticeHours?: number;
   tripType: TripType;
   outboundMode: DateMode;
   outboundStart: string;
@@ -27,6 +33,10 @@ export interface FollowUpInput {
   name: string;
   originIata: string;
   destinationIata: string;
+  destinationIatas?: string[];
+  mode?: FollowUpMode;
+  lookaheadDays?: number;
+  minNoticeHours?: number;
   tripType: TripType;
   outboundMode: DateMode;
   outboundStart: string;
@@ -49,6 +59,9 @@ export interface AppSettings {
 }
 
 export interface FlightPriceResult {
+  destinationIata?: string;
+  /** Minimum round-trip fare shown for an outbound calendar day, without a selected return date. */
+  isCalendarMinimum?: boolean;
   outboundDate: string;
   inboundDate: string | null;
   amount: number | null;
@@ -58,7 +71,7 @@ export interface FlightPriceResult {
   observedText: string;
   details: string | null;
   flightOptions?: FlightItineraryOption[];
-  flightDetailsStatus?: "available" | "unavailable";
+  flightDetailsStatus?: "available" | "unavailable" | "no_matching_flights";
 }
 
 export interface FlightItineraryOption {

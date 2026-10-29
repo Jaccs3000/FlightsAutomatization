@@ -53,3 +53,7 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+## Inicio en Windows
+
+Ejecuta `vuelos.vbs` para abrir enseguida una pestana de espera. Cuando el backend local este listo, esa misma pestana redirige a Vuela. El proceso corre oculto y no requiere cambios en variables de entorno ni en el registro.

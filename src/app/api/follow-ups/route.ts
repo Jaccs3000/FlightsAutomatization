@@ -28,7 +28,7 @@ export async function POST(request: NextRequest) {
     if (!parsed.success) return NextResponse.json({ error: parsed.error.issues[0]?.message ?? "Revisa los datos del seguimiento." }, { status: 400 });
     const id = typeof body.id === "string" ? body.id : undefined;
     const followUp = await saveFollowUp(parsed.data, id);
-    await logDiagnostic("Seguimientos", id ? "Actualizar" : "Crear", "success", `${id ? "Seguimiento actualizado" : "Seguimiento creado"}: ${followUp.originIata} → ${followUp.destinationIata}, ${followUp.tripType === "round_trip" ? "ida y vuelta" : "solo ida"}.`);
+    await logDiagnostic("Seguimientos", id ? "Actualizar" : "Crear", "success", `${id ? "Seguimiento actualizado" : "Seguimiento creado"}: ${followUp.originIata} → ${(followUp.destinationIatas ?? [followUp.destinationIata]).join(", ")}, ${followUp.mode === "weekend_escape" ? "escape fin de semana" : followUp.tripType === "round_trip" ? "ida y vuelta" : "solo ida"}.`);
     return NextResponse.json({ followUp }, { status: id ? 200 : 201 });
   } catch (error) { await logDiagnostic("Seguimientos", "Guardar", "error", errorSummary(error)); return errorResponse(error); }
 }
