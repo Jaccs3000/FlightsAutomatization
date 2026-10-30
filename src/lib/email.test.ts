@@ -110,8 +110,8 @@ describe("Gmail flight alert message", () => {
     expect(message.subject).toContain("CLO, CTG");
     expect(message.html).toContain("Escape fin de semana");
     expect(message.html).toContain("CLO · $ 300.000");
-    expect(message.html).toContain(">Destino</th>");
-    expect(message.html).toContain(">CTG</td>");
+    expect(message.html).not.toContain(">Destino</th>");
+    expect(message.html).not.toContain(">CTG</td>");
     expect(message.html).toContain("15 Nov 8:00 pm");
   });
 

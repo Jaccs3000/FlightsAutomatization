@@ -6,6 +6,8 @@ import { dateRange, daysBetween, validRoundTripPairs, weekendEscapeCandidates } 
 import { parsePrice } from "./prices";
 import { parseGoogleFlightCard } from "./google-flights-parser";
 import type { FlightItineraryOption } from "./types";
+import { logDiagnostic } from "./diagnostics";
+import { calendarDateTextMatches } from "./google-flights-date-match";
 
 type FlightBrowserGlobal = typeof globalThis & { __vuelaFlightBrowsers?: Map<string, Browser>; __vuelaStoppedRunIds?: Set<string> };
 const flightGlobal = globalThis as FlightBrowserGlobal;
@@ -21,7 +23,42 @@ export type SearchProgress = {
 };
 export type SearchProgressCallback = (progress: SearchProgress) => void;
 
-type RunScreenshotContext = { directory: string; sequence: number; manifest: Array<{ file: string; label: string; capturedAt: string; url: string }> };
+type RunScreenshotContext = { runId?: string; directory: string; sequence: number; manifest: Array<{ file: string; label: string; capturedAt: string; url: string }> };
+
+async function logFlightStep(context: RunScreenshotContext | null | undefined, event: string, outcome: "info" | "success" | "warning" | "error", data: Record<string, unknown>) {
+  const payload = JSON.stringify({ runId: context?.runId ?? null, at: new Date().toISOString(), ...data });
+  console.info(`[GoogleFlights] ${event} ${payload}`);
+  await logDiagnostic("Google Flights", event, outcome, payload);
+}
+
+async function dateControlSnapshot(page: Page) {
+  // Google alternates between native inputs and compact date buttons. Keep the
+  // snapshot limited to the search form (never calendar day cells).
+  return page.locator("input, button, [role='button'], [role='textbox']").evaluateAll((nodes) => nodes
+    .map((node) => {
+      const element = node as HTMLElement;
+      const rect = element.getBoundingClientRect();
+      const dialog = element.closest("[role='dialog']");
+      const dialogRect = dialog?.getBoundingClientRect();
+      return {
+        placeholder: element.getAttribute("placeholder") ?? "",
+        label: element.getAttribute("aria-label") ?? "",
+        title: element.getAttribute("title") ?? "",
+        value: (element as HTMLInputElement).value ?? "",
+        text: (element.innerText ?? element.textContent ?? "").trim(),
+        inDialog: Boolean(dialog),
+        inDialogHeader: Boolean(dialogRect && rect.top >= dialogRect.top && rect.top < dialogRect.top + 110),
+        visible: rect.width > 0 && rect.height > 0,
+      };
+    })
+    .filter((item) => (!item.inDialog || item.inDialogHeader) && item.visible
+      && (/salida|vuelta|regreso|fecha/i.test(`${item.placeholder} ${item.label} ${item.title}`)
+        || /\b\d{1,2}\s+[a-záéíóú]{3,}\b/i.test(`${item.value} ${item.text} ${item.label}`))));
+}
+
+function dateIsInControls(snapshot: Awaited<ReturnType<typeof dateControlSnapshot>>, date: string) {
+  return snapshot.some((item) => calendarDateTextMatches(`${item.value} ${item.text} ${item.label} ${item.title}`, date));
+}
 
 function safeScreenshotName(value: string) {
   return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 90) || "pantalla";
@@ -249,15 +286,26 @@ async function openCalendar(page: Page, field: "Salida" | "Regreso" = "Salida") 
   return dialog;
 }
 
-async function closeCalendar(page: Page) {
+async function closeCalendar(page: Page, screenshots?: RunScreenshotContext | null) {
   // The footer action varies between locales/layouts ("Listo", "Hecho" and
   // "Done"). Search only inside the date dialog to avoid unrelated controls.
   const dialog = page.getByRole("dialog").last();
   if (!(await dialog.count()) || !(await dialog.isVisible().catch(() => false))) return;
   const done = dialog.getByRole("button", { name: /listo|hecho|done/i }).last();
   if (await done.count() && await done.isVisible().catch(() => false)) {
-    await done.click();
-    await page.getByRole("dialog").last().waitFor({ state: "hidden", timeout: 5_000 }).catch(() => undefined);
+    await logFlightStep(screenshots, "Cerrar calendario", "info", { button: await done.getAttribute("aria-label").catch(() => null), state: "click" });
+    await done.click({ timeout: 8_000 });
+    const closed = await page.getByRole("dialog").last().waitFor({ state: "hidden", timeout: 5_000 }).then(() => true).catch(() => false);
+    if (closed) return;
+  }
+  await logFlightStep(screenshots, "Cerrar calendario", "warning", { state: "fallback-escape", dialogVisible: await dialog.isVisible().catch(() => false) });
+  await page.keyboard.press("Escape").catch(() => undefined);
+  const closed = await page.getByRole("dialog").last().waitFor({ state: "hidden", timeout: 3_000 }).then(() => true).catch(() => false);
+  if (!closed) {
+    await captureRunScreen(page, screenshots, "error-calendario-no-cerrado");
+    const inputs = await dateControlSnapshot(page).catch(() => []);
+    await logFlightStep(screenshots, "Cerrar calendario", "error", { state: "still-open", inputs });
+    throw new Error("Google Flights mantuvo abierto el calendario después de confirmar las fechas.");
   }
 }
 
@@ -265,7 +313,7 @@ function calendarDateLabel(date: string) {
   return new Date(`${date}T00:00:00Z`).toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
 }
 
-async function selectCalendarDate(page: Page, date: string, screenshots?: RunScreenshotContext | null) {
+async function selectCalendarDateLegacy(page: Page, date: string, screenshots?: RunScreenshotContext | null) {
   const selector = `[aria-label^=${JSON.stringify(calendarDateLabel(date))}]`;
   const dialog = page.getByRole("dialog").last();
   for (let month = 0; month < 14; month++) {
@@ -282,6 +330,89 @@ async function selectCalendarDate(page: Page, date: string, screenshots?: RunScr
     await captureRunScreen(page, screenshots, `navegacion-calendario-${date}-mes-${month + 2}`);
   }
   throw new Error(`El calendario no mostró la fecha de ida ${date}.`);
+}
+
+async function selectCalendarDate(page: Page, date: string, screenshots?: RunScreenshotContext | null) {
+  const selector = `[aria-label^=${JSON.stringify(calendarDateLabel(date))}]`;
+  const dialog = page.getByRole("dialog").last();
+  await dialog.waitFor({ state: "visible", timeout: 10_000 });
+  await logFlightStep(screenshots, "Seleccionar fecha calendario", "info", { targetDate: date, targetLabel: calendarDateLabel(date), initialInputs: await dateControlSnapshot(page) });
+
+  for (let month = 0; month < 14; month++) {
+    const dialogBox = await dialog.boundingBox();
+    const matchingDays = dialog.locator(selector);
+    for (let index = (await matchingDays.count()) - 1; index >= 0; index--) {
+      const day = matchingDays.nth(index);
+      if (!(await day.isVisible().catch(() => false))) continue;
+      const box = await day.boundingBox().catch(() => null);
+      const isCurrentMonthCell = Boolean(box && dialogBox && box.x >= dialogBox.x && box.x < dialogBox.x + dialogBox.width && box.y >= dialogBox.y + 75 && box.y < dialogBox.y + dialogBox.height - 60);
+      if (!isCurrentMonthCell) continue;
+
+      const ariaLabel = await day.getAttribute("aria-label").catch(() => null);
+      await captureRunScreen(page, screenshots, `calendario-${date}-antes-de-seleccionar`);
+      await day.click({ timeout: 8_000 });
+      for (let wait = 0; wait < 20; wait++) {
+        const selectedInputs = await dateControlSnapshot(page);
+        if (dateIsInControls(selectedInputs, date)) {
+          await logFlightStep(screenshots, "Seleccionar fecha calendario", "success", { targetDate: date, ariaLabel, attempt: 1, selectedInputs });
+          await captureRunScreen(page, screenshots, `calendario-${date}-seleccion-confirmada`);
+          return;
+        }
+        await page.waitForTimeout(250);
+      }
+
+      await logFlightStep(screenshots, "Seleccionar fecha calendario", "warning", { targetDate: date, ariaLabel, attempt: 1, issue: "click-no-confirmado", selectedInputs: await dateControlSnapshot(page) });
+      await day.click({ force: true, timeout: 5_000 }).catch(() => undefined);
+      for (let wait = 0; wait < 12; wait++) {
+        const selectedInputs = await dateControlSnapshot(page);
+        if (dateIsInControls(selectedInputs, date)) {
+          await logFlightStep(screenshots, "Seleccionar fecha calendario", "success", { targetDate: date, ariaLabel, attempt: 2, selectedInputs });
+          await captureRunScreen(page, screenshots, `calendario-${date}-seleccion-confirmada`);
+          return;
+        }
+        await page.waitForTimeout(250);
+      }
+      await captureRunScreen(page, screenshots, `error-fecha-no-confirmada-${date}`);
+      const selectedInputs = await dateControlSnapshot(page);
+      await logFlightStep(screenshots, "Seleccionar fecha calendario", "error", { targetDate: date, ariaLabel, attempt: 2, issue: "seleccion-no-reflejada-en-campos", selectedInputs });
+      throw new Error(`Google Flights no confirmó la selección de ${date}; campos: ${JSON.stringify(selectedInputs)}.`);
+    }
+
+    const previousMonthText = (await dialog.innerText().catch(() => "")).slice(0, 240);
+    const next = dialog.getByRole("button", { name: /siguiente|pr[oÃ³]ximo|next/i }).last();
+    if (!(await next.count()) || !(await next.isVisible().catch(() => false))) {
+      const visibleLabels = await dialog.locator("[role='button'][aria-label]").evaluateAll((items) => items.map((item) => item.getAttribute("aria-label") ?? "").slice(0, 12));
+      await logFlightStep(screenshots, "Navegar calendario", "error", { targetDate: date, month, issue: "sin-boton-mes-siguiente", visibleLabels, controls: await dateControlSnapshot(page) });
+      break;
+    }
+    await next.click();
+    let changed = false;
+    for (let wait = 0; wait < 20; wait++) {
+      const currentMonthText = (await dialog.innerText().catch(() => "")).slice(0, 240);
+      if (currentMonthText !== previousMonthText) { changed = true; break; }
+      await page.waitForTimeout(150);
+    }
+    await logFlightStep(screenshots, "Navegar calendario", changed ? "info" : "warning", { targetDate: date, month, changed, visibleMonthText: (await dialog.innerText().catch(() => "")).slice(0, 240) });
+    await captureRunScreen(page, screenshots, `navegacion-calendario-${date}-mes-${month + 2}`);
+  }
+
+  const state = { targetDate: date, controls: await dateControlSnapshot(page).catch(() => []), dialogVisible: await dialog.isVisible().catch(() => false), dialogText: (await dialog.innerText().catch(() => "")).slice(0, 500) };
+  await captureRunScreen(page, screenshots, `error-fecha-calendario-no-encontrada-${date}`);
+  await logFlightStep(screenshots, "Seleccionar fecha calendario", "error", state);
+  throw new Error(`Google Flights no confirmó la fecha ${date}. ${JSON.stringify(state)}`);
+}
+
+async function assertSelectedDates(page: Page, outboundDate: string, inboundDate?: string | null, screenshots?: RunScreenshotContext | null) {
+  const controls = await dateControlSnapshot(page);
+  const outboundSelected = dateIsInControls(controls, outboundDate);
+  const inboundSelected = !inboundDate || dateIsInControls(controls, inboundDate);
+  await logFlightStep(screenshots, "Verificar fechas seleccionadas", outboundSelected && inboundSelected ? "success" : "error", {
+    outboundDate, inboundDate: inboundDate ?? null, outboundSelected, inboundSelected, controls,
+  });
+  if (!outboundSelected || !inboundSelected) {
+    await captureRunScreen(page, screenshots, `error-verificar-fechas-${outboundDate}${inboundDate ? `-${inboundDate}` : ""}`);
+    throw new Error(`Google Flights no dejó seleccionadas las fechas solicitadas. Ida ${outboundDate}: ${outboundSelected ? "confirmada" : "no confirmada"}; regreso ${inboundDate ?? "no aplica"}: ${inboundSelected ? "confirmado" : "no confirmado"}.`);
+  }
 }
 
 async function setAirport(page: Page, label: RegExp, code: string) {
@@ -440,7 +571,9 @@ async function getRoundTripOptions(page: Page, threshold: number, escapeCriteria
 }
 
 async function fetchFlightOptionsAttempt(page: Page, followUp: FollowUp, result: FlightPriceResult, destination: string, escapeCriteria?: EscapeCriteria, screenshots?: RunScreenshotContext | null) {
+  const attemptStartedAt = Date.now();
   try {
+    await logFlightStep(screenshots, "Iniciar lectura de horarios", "info", { destination, outboundDate: result.outboundDate, inboundDate: result.inboundDate, tripType: followUp.tripType, thresholdCop: followUp.maxPriceCop });
     // Start from the same clean search form for each qualifying calendar fare.
     // Google replaces the date inputs with compact date controls after results load.
     await page.goto(FLIGHTS_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
@@ -452,33 +585,39 @@ async function fetchFlightOptionsAttempt(page: Page, followUp: FollowUp, result:
     await captureRunScreen(page, screenshots, `calendario-detalle-${destination}-${result.outboundDate}`);
     await selectCalendarDate(page, result.outboundDate, screenshots);
     if (followUp.tripType === "round_trip" && result.inboundDate) await selectCalendarDate(page, result.inboundDate, screenshots);
-    await closeCalendar(page);
+    await assertSelectedDates(page, result.outboundDate, followUp.tripType === "round_trip" ? result.inboundDate : null, screenshots);
+    await closeCalendar(page, screenshots);
     // The page also has many suggested-destination cards whose accessible
     // names begin with "Buscar vuelos". Target the actual form submit button.
     const search = page.locator('button[aria-label="Buscar"]').last();
     await search.waitFor({ state: "visible", timeout: 10_000 });
+    await logFlightStep(screenshots, "Buscar detalle tras precio válido", "info", { destination, outboundDate: result.outboundDate, inboundDate: result.inboundDate, buttonVisible: await search.isVisible().catch(() => false), calendarOpen: await page.getByRole("dialog").last().isVisible().catch(() => false) });
     await search.click();
     await captureRunScreen(page, screenshots, `resultados-detalle-${destination}-${result.outboundDate}`);
     const options = followUp.tripType === "one_way"
       ? await getOneWayOptions(page, followUp.maxPriceCop, screenshots)
       : await getRoundTripOptions(page, followUp.maxPriceCop, escapeCriteria, screenshots);
+    await logFlightStep(screenshots, "Detalle de horarios leído", options.length ? "success" : "warning", { destination, outboundDate: result.outboundDate, inboundDate: result.inboundDate, optionCount: options.length, elapsedMs: Date.now() - attemptStartedAt, escapeScheduleApplied: Boolean(escapeCriteria) });
     if (escapeCriteria && !options.length) return { ...result, meetsThreshold: false, details: [result.details, "El calendario dio un precio bajo el límite, pero no se encontraron vuelos que cumplan los horarios y la anticipación configurados."].filter(Boolean).join(" "), flightOptions: [], flightDetailsStatus: "no_matching_flights" as const };
     return { ...result, flightOptions: options, flightDetailsStatus: options.length ? "available" as const : "unavailable" as const };
   } catch (error) {
     await captureRunScreen(page, screenshots, `error-detalle-${destination}-${result.outboundDate}`);
     const reason = error instanceof Error ? error.message.slice(0, 900) : "Error no identificado";
+    await logFlightStep(screenshots, "Fallo al leer detalle de horarios", "error", { destination, outboundDate: result.outboundDate, inboundDate: result.inboundDate, reason, elapsedMs: Date.now() - attemptStartedAt, url: page.url().split("?")[0] });
     return { ...result, details: [result.details, `No se pudo obtener el detalle de vuelos: ${reason}`].filter(Boolean).join(" "), flightOptions: [], flightDetailsStatus: "unavailable" as const };
   }
 }
 
 async function fetchFlightOptions(page: Page, followUp: FollowUp, result: FlightPriceResult, destination = followUp.destinationIata, escapeCriteria?: EscapeCriteria, screenshots?: RunScreenshotContext | null) {
-  let detailed = await fetchFlightOptionsAttempt(page, followUp, result, destination, escapeCriteria, screenshots);
-  const transientResultFailure = /transient google flights results error|no se encontraron resultados.{0,100}se produjo un error|there was an error.{0,100}results/i;
-  if (detailed.flightDetailsStatus === "unavailable" && transientResultFailure.test(detailed.details ?? "")) {
-    await page.waitForTimeout(2_000);
+  let detailed: Awaited<ReturnType<typeof fetchFlightOptionsAttempt>> | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await logFlightStep(screenshots, "Intento de lectura de horarios", "info", { attempt, maxAttempts: 2, destination, outboundDate: result.outboundDate, inboundDate: result.inboundDate });
     detailed = await fetchFlightOptionsAttempt(page, followUp, result, destination, escapeCriteria, screenshots);
+    if (detailed.flightDetailsStatus !== "unavailable" || attempt === 2) break;
+    await logFlightStep(screenshots, "Reintento de lectura de horarios", "warning", { failedAttempt: attempt, reason: detailed.details?.slice(-900) ?? "sin detalle" });
+    await page.waitForTimeout(2_000);
   }
-  return detailed;
+  return detailed!;
 }
 
 function bogotaToday() {
@@ -527,10 +666,12 @@ async function scanWeekendEscape(page: Page, followUp: FollowUp, screenshots?: R
       await openCalendar(page, "Salida");
       await captureRunScreen(page, screenshots, `calendario-salida-${destination}-${outboundDate}`);
       await selectCalendarDate(page, outboundDate, screenshots);
+      await assertSelectedDates(page, outboundDate, null, screenshots);
       await captureRunScreen(page, screenshots, `calendario-ida-seleccionada-${destination}-${outboundDate}`);
       const returnPrices = new Map((await parseCalendarPrices(page, inboundDates, "Regreso", undefined, 12, screenshots)).map((fare) => [fare.outboundDate, fare]));
+      await logFlightStep(screenshots, "Precios de regreso leídos", returnPrices.size ? "success" : "warning", { destination, outboundDate, expectedDates: inboundDates, prices: [...returnPrices.values()].map(({ outboundDate: date, amount, currency }) => ({ date, amount, currency })) });
       await captureRunScreen(page, screenshots, `calendario-regresos-con-precios-${destination}-${outboundDate}`);
-      await closeCalendar(page);
+      await closeCalendar(page, screenshots);
       for (const candidate of matchingCandidates) {
         const fare = returnPrices.get(candidate.inboundDate);
         if (!fare) continue;
@@ -577,6 +718,7 @@ export async function scanGoogleFlights(followUp: FollowUp, runId?: string, onPr
       : validRoundTripPairs(followUp).length;
   onProgress?.({ phase: "Abriendo Google Flights", completed: 0, total: plannedTotal });
   const screenshotContext: RunScreenshotContext | null = runId ? {
+    runId,
     directory: path.join(process.cwd(), "prints de pantallas", `${new Date().toISOString().replace(/[:.]/g, "-")}_${safeScreenshotName(followUp.name)}_${runId}`),
     sequence: 0,
     manifest: [],
@@ -631,10 +773,12 @@ export async function scanGoogleFlights(followUp: FollowUp, runId?: string, onPr
           // instead of rereading a stale day cell. Wait for the target fare in
           // this same calendar session before confirming/closing it.
           await selectCalendarDate(page, date, screenshotContext);
+          await assertSelectedDates(page, date, null, screenshotContext);
           await captureRunScreen(page, screenshotContext, `calendario-${date}-intento-${attempt}-despues-del-clic`);
           fares = await parseCalendarPrices(page, [date], "Salida", (summary) => onProgress?.({ phase, completed: index, total: candidateDates.length, current: summary }), 12, screenshotContext);
+          await logFlightStep(screenshotContext, "Precio de ida leído", fares.some((item) => item.outboundDate === date) ? "success" : "warning", { date, attempt, fare: fares.find((item) => item.outboundDate === date) ?? null });
           await captureRunScreen(page, screenshotContext, `calendario-${date}-intento-${attempt}-lectura`);
-          await closeCalendar(page);
+          await closeCalendar(page, screenshotContext);
           if (!fares.some((item) => item.outboundDate === date) && attempt < 3) {
             onProgress?.({ phase: "Esperando actualización del precio", completed: index, total: candidateDates.length, current: `${date} · intento ${attempt}/3` });
             await page.waitForTimeout(1_000);
@@ -659,10 +803,12 @@ export async function scanGoogleFlights(followUp: FollowUp, runId?: string, onPr
         await openCalendar(page, "Salida");
         await captureRunScreen(page, screenshotContext, `calendario-salida-${outboundDate}`);
         await selectCalendarDate(page, outboundDate, screenshotContext);
+        await assertSelectedDates(page, outboundDate, null, screenshotContext);
         await captureRunScreen(page, screenshotContext, `calendario-ida-seleccionada-${outboundDate}`);
         const returnPrices = new Map((await parseCalendarPrices(page, inboundDates, "Regreso", undefined, 12, screenshotContext)).map((fare) => [fare.outboundDate, fare]));
+        await logFlightStep(screenshotContext, "Precios de regreso leídos", returnPrices.size ? "success" : "warning", { outboundDate, expectedDates: inboundDates, prices: [...returnPrices.values()].map(({ outboundDate: date, amount, currency }) => ({ date, amount, currency })) });
         await captureRunScreen(page, screenshotContext, `calendario-regresos-con-precios-${outboundDate}`);
-        await closeCalendar(page);
+        await closeCalendar(page, screenshotContext);
         for (const inboundDate of inboundDates) {
           const price = returnPrices.get(inboundDate);
           if (!price) continue;
